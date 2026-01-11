@@ -3,12 +3,16 @@
 
 set -e
 
+# Resolve script location
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+BASELINE_DIR="$(dirname "$SCRIPT_DIR")"
+ORB_SLAM3_DIR="$BASELINE_DIR/ORB_SLAM3"
+
 # Paths
-ORB_SLAM3_PATH="/workspace/src/baselines/ORB_SLAM3"
-DATA_PATH="/workspace/src/data/tum_rgbd"
+DATA_PATH="/workspace/data/tum_rgbd"
 OUTPUT_PATH="/workspace/experiments/baselines/orb_slam3"
-VOCAB_PATH="$ORB_SLAM3_PATH/Vocabulary/ORBvoc.txt"
-EXECUTABLE="$ORB_SLAM3_PATH/Examples/RGB-D/rgbd_tum"
+VOCAB_PATH="$ORB_SLAM3_DIR/Vocabulary/ORBvoc.txt"
+EXECUTABLE="$ORB_SLAM3_DIR/Examples/RGB-D/rgbd_tum"
 
 # Create output directories
 mkdir -p "$OUTPUT_PATH/trajectories"
@@ -25,12 +29,16 @@ SEQUENCES=(
 )
 
 # TUM camera calibration files
-FR1_CALIB="$ORB_SLAM3_PATH/Examples/RGB-D/TUM1.yaml"
-FR3_CALIB="$ORB_SLAM3_PATH/Examples/RGB-D/TUM3.yaml"
+FR1_CALIB="$ORB_SLAM3_DIR/Examples/RGB-D/TUM1.yaml"
+FR3_CALIB="$ORB_SLAM3_DIR/Examples/RGB-D/TUM3.yaml"
 
 echo "================================================"
 echo "Running ORB-SLAM3 baseline on TUM RGB-D"
 echo "================================================"
+echo "ORB-SLAM3:   $ORB_SLAM3_DIR"
+echo "Dataset:     $DATA_PATH"
+echo "Output:      $OUTPUT_PATH"
+echo ""
 
 # Check for xvfb (needed for headless operation)
 if ! command -v xvfb-run &> /dev/null; then
@@ -108,4 +116,4 @@ echo "================================================"
 echo "Trajectories saved in: $OUTPUT_PATH/trajectories/"
 echo ""
 echo "Next: Run evaluation script"
-echo "  python scripts/evaluate_baseline.py"
+echo "  python /workspace/scripts/evaluate_baseline.py"

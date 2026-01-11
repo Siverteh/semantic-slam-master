@@ -2,7 +2,7 @@
 
 dataset:
   name: "tum_rgbd"
-  root: "/workspace/src/data/tum_rgbd"
+  root: "/workspace/data/tum_rgbd"
 
   # Available sequences
   sequences:
@@ -37,10 +37,11 @@ dataset:
 
 # ORB-SLAM3 baseline parameters
 orb_slam3:
-  vocab_path: "/workspace/src/baselines/ORB_SLAM3/Vocabulary/ORBvoc.txt"
-  config_freiburg1: "/workspace/src/baselines/ORB_SLAM3/Examples/RGB-D/TUM1.yaml"
-  config_freiburg3: "/workspace/src/baselines/ORB_SLAM3/Examples/RGB-D/TUM3.yaml"
-  executable: "/workspace/src/baselines/ORB_SLAM3/Examples/RGB-D/rgbd_tum"
+  root: "/workspace/baselines/orb_slam3/ORB_SLAM3"
+  vocab_path: "/workspace/baselines/orb_slam3/ORB_SLAM3/Vocabulary/ORBvoc.txt"
+  config_freiburg1: "/workspace/baselines/orb_slam3/ORB_SLAM3/Examples/RGB-D/TUM1.yaml"
+  config_freiburg3: "/workspace/baselines/orb_slam3/ORB_SLAM3/Examples/RGB-D/TUM3.yaml"
+  executable: "/workspace/baselines/orb_slam3/ORB_SLAM3/Examples/RGB-D/rgbd_tum"
 
 # Evaluation settings
 evaluation:

@@ -1,11 +1,17 @@
 #!/bin/bash
-# Fixed setup script for ORB-SLAM3 baseline
+# Setup script for ORB-SLAM3 baseline
 
 set -e  # Exit on error
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+BASELINE_DIR="$(dirname "$SCRIPT_DIR")"
+ORB_SLAM3_DIR="$BASELINE_DIR/ORB_SLAM3"
 
 echo "================================================"
 echo "Setting up ORB-SLAM3 for baseline experiments"
 echo "================================================"
+echo "Installation directory: $BASELINE_DIR"
+echo ""
 
 # Function to check if a package is installed
 check_package() {
@@ -29,7 +35,7 @@ REQUIRED_PACKAGES=(
     "pkg-config"
 )
 
-# Add Pangolin build dependencies (we'll build it from source)
+# Add Pangolin build dependencies
 PANGOLIN_DEPS=(
     "libglew-dev"
     "libpython3-dev"
@@ -101,7 +107,7 @@ if [ "$PANGOLIN_FOUND" = false ]; then
     echo "This is required for ORB-SLAM3 visualization"
 
     # Build Pangolin in /tmp
-    PANGOLIN_BUILD_DIR="/tmp/pangolin-build-$"
+    PANGOLIN_BUILD_DIR="/tmp/pangolin-build-$$"
     mkdir -p "$PANGOLIN_BUILD_DIR"
     cd "$PANGOLIN_BUILD_DIR"
 
@@ -136,19 +142,17 @@ if [ "$PANGOLIN_FOUND" = false ]; then
     fi
 fi
 
-# Navigate to baselines directory
-cd /workspace/src/baselines
-
 # Clone ORB-SLAM3
-if [ ! -d "ORB_SLAM3" ]; then
+if [ ! -d "$ORB_SLAM3_DIR" ]; then
     echo ""
     echo "Cloning ORB-SLAM3..."
+    cd "$BASELINE_DIR"
     git clone https://github.com/UZ-SLAMLab/ORB_SLAM3.git
     cd ORB_SLAM3
 else
     echo ""
     echo "ORB-SLAM3 already exists, updating..."
-    cd ORB_SLAM3
+    cd "$ORB_SLAM3_DIR"
     git pull || echo "Warning: Could not pull latest changes"
 fi
 
@@ -294,12 +298,13 @@ if ldd Examples/RGB-D/rgbd_tum | grep -q "not found"; then
 fi
 echo "✓ All runtime dependencies satisfied"
 
-# Create convenience symlinks
-cd /workspace/src/baselines
-if [ ! -L "ORBvoc.txt" ]; then
-    ln -s ORB_SLAM3/Vocabulary/ORBvoc.txt ORBvoc.txt
-    echo "✓ Created vocabulary symlink"
+# Install xvfb for headless operation
+echo ""
+echo "Installing xvfb for headless operation..."
+if ! command -v xvfb-run &> /dev/null; then
+    apt-get update -qq && apt-get install -y xvfb
 fi
+echo "✓ xvfb installed"
 
 echo ""
 echo "================================================"
@@ -307,10 +312,10 @@ echo "✓ ORB-SLAM3 Setup Complete!"
 echo "================================================"
 echo ""
 echo "Installation Summary:"
-echo "  Root:        $(pwd)/ORB_SLAM3"
-echo "  Library:     $(pwd)/ORB_SLAM3/lib/libORB_SLAM3.so"
-echo "  Vocabulary:  $(pwd)/ORB_SLAM3/Vocabulary/ORBvoc.txt"
-echo "  Examples:    $(pwd)/ORB_SLAM3/Examples/"
+echo "  Root:        $ORB_SLAM3_DIR"
+echo "  Library:     $ORB_SLAM3_DIR/lib/libORB_SLAM3.so"
+echo "  Vocabulary:  $ORB_SLAM3_DIR/Vocabulary/ORBvoc.txt"
+echo "  Examples:    $ORB_SLAM3_DIR/Examples/"
 echo ""
 echo "Available executables:"
 echo "  - Monocular:  Examples/Monocular/mono_euroc"
@@ -318,9 +323,8 @@ echo "  - RGB-D:      Examples/RGB-D/rgbd_tum"
 echo "  - Stereo:     Examples/Stereo/stereo_euroc"
 echo ""
 echo "Next steps:"
-echo "  1. Run quick test: cd ORB_SLAM3 && ./Examples/RGB-D/rgbd_tum --help"
-echo "  2. Run baseline:   bash scripts/run_orb_slam3_baseline.sh"
-echo "  3. Evaluate:       python scripts/evaluate_baseline.py"
+echo "  1. Run baseline: bash $SCRIPT_DIR/run_baseline.sh"
+echo "  2. Evaluate:     python /workspace/scripts/evaluate_baseline.py"
 echo ""
 echo "Pangolin Viewer: Enabled (GUI will open during SLAM)"
 echo "================================================"

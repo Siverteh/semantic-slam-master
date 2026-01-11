@@ -23,7 +23,7 @@ from evo.tools import file_interface
 
 # Paths
 PROJECT_ROOT = Path("/workspace")
-DATA_PATH = PROJECT_ROOT / "src/data/tum_rgbd"
+DATA_PATH = PROJECT_ROOT / "data/tum_rgbd"
 BASELINE_PATH = PROJECT_ROOT / "experiments/baselines/orb_slam3"
 TRAJ_PATH = BASELINE_PATH / "trajectories"
 PLOT_PATH = BASELINE_PATH / "plots"
@@ -243,6 +243,9 @@ def main():
     print("=" * 60)
     print("ORB-SLAM3 Baseline Evaluation")
     print("=" * 60)
+    print(f"Data path: {DATA_PATH}")
+    print(f"Results path: {BASELINE_PATH}")
+    print()
 
     # Evaluate all sequences
     results = {}

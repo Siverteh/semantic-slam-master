@@ -37,8 +37,8 @@ ENV/
 *~
 
 # Data (large files)
-src/data/tum_rgbd/*/
-!src/data/tum_rgbd/.gitkeep
+data/tum_rgbd/*/
+!data/tum_rgbd/.gitkeep
 *.bag
 *.pcd
 *.ply
