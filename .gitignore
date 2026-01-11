@@ -1,2 +1,90 @@
-venv
-data/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data (large files)
+src/data/tum_rgbd/*/
+!src/data/tum_rgbd/.gitkeep
+*.bag
+*.pcd
+*.ply
+
+# Experiments
+experiments/
+!experiments/.gitkeep
+
+# Models
+*.pth
+*.ckpt
+*.pt
+models/pretrained/
+!models/.gitkeep
+
+# Logs
+*.log
+logs/
+wandb/
+
+# Build artifacts
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+Makefile
+
+# ORB-SLAM3
+src/baselines/ORB_SLAM3/
+src/baselines/pyslam/
+
+# Temporary
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Papers (optional - keep local copies)
+papers/*.pdf
+
+# Thesis LaTeX
+thesis/*.aux
+thesis/*.log
+thesis/*.out
+thesis/*.toc
+thesis/*.bbl
+thesis/*.blg
+thesis/*.synctex.gz
+thesis/*.fdb_latexmk
+thesis/*.fls
