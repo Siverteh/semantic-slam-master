@@ -24,7 +24,7 @@ from evo.tools import file_interface
 # Paths
 PROJECT_ROOT = Path("/workspace")
 DATA_PATH = PROJECT_ROOT / "data/tum_rgbd"
-BASELINE_PATH = PROJECT_ROOT / "experiments/baselines/orb_slam3"
+BASELINE_PATH = PROJECT_ROOT / "experiments/baselines/pyslam"
 TRAJ_PATH = BASELINE_PATH / "trajectories"
 PLOT_PATH = BASELINE_PATH / "plots"
 

@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     # ORB-SLAM3 dependencies
     libglew-dev libgl1-mesa-dev libglu1-mesa-dev \
     libeigen3-dev libopencv-dev libssl-dev \
-    libboost-all-dev \
+    libboost-all-dev libepoxy-dev \
     # Pangolin dependencies
     libglfw3-dev libxkbcommon-dev libwayland-dev \
     # Python

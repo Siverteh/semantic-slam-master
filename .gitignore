@@ -43,10 +43,6 @@ data/tum_rgbd/*/
 *.pcd
 *.ply
 
-# Experiments
-experiments/
-!experiments/.gitkeep
-
 # Models
 *.pth
 *.ckpt
@@ -65,9 +61,7 @@ cmake_install.cmake
 CMakeCache.txt
 Makefile
 
-# ORB-SLAM3
-src/baselines/ORB_SLAM3/
-src/baselines/pyslam/
+
 
 # Temporary
 *.tmp
@@ -76,7 +70,6 @@ src/baselines/pyslam/
 Thumbs.db
 
 # Papers (optional - keep local copies)
-papers/*.pdf
 
 # Thesis LaTeX
 thesis/*.aux
@@ -88,3 +81,5 @@ thesis/*.blg
 thesis/*.synctex.gz
 thesis/*.fdb_latexmk
 thesis/*.fls
+
+ORB_SLAM3
