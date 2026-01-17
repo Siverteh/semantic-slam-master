@@ -61,7 +61,9 @@ cmake_install.cmake
 CMakeCache.txt
 Makefile
 
-
+# ORB-SLAM3
+src/baselines/orb_slam3/ORB_SLAM3/
+src/baselines/pyslam/pyslam/
 
 # Temporary
 *.tmp
