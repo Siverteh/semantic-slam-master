@@ -1,0 +1,66 @@
+# Training Configuration for Semantic SLAM Heads
+
+# Model architecture
+model:
+  backbone: "vit_small_patch16_dinov3.lvd1689m"  # DINOv3-ViT-S (384-dim, 22M params)
+  # Other options:
+  # - vit_base_patch16_dinov3.lvd1689m   # 768-dim, 86M params (slower)
+  # - vit_large_patch16_dinov3.lvd1689m  # 1024-dim, 304M params (much slower)
+  
+  input_size: 448  # Image resolution (448 -> 28x28 patches with 16x16 patch size)
+  num_keypoints: 500  # Number of keypoints to select
+  
+  # Keypoint Selector Head
+  selector_hidden: 256
+  selector_layers: 3
+  
+  # Descriptor Refiner Head
+  descriptor_dim: 128  # Output descriptor dimension
+  refiner_hidden: 256
+  refiner_layers: 3
+  
+  # Uncertainty Estimator Head
+  estimator_hidden: 128
+
+# Dataset configuration
+dataset:
+  root: "data/tum_rgbd"
+  train_sequences:
+    - "rgbd_dataset_freiburg1_desk"     # Static office baseline
+    - "rgbd_dataset_freiburg1_room"     # More complex scene
+  val_sequences:
+    - "rgbd_dataset_freiburg1_plant"    # Low texture validation
+  frame_spacing: 1  # Spacing between consecutive frames
+  max_frames: null  # null = use all frames, or set to limit (e.g., 500)
+
+# Loss configuration
+loss:
+  weights:
+    photo: 1.0       # Photometric consistency
+    repeat: 2.0      # Keypoint repeatability (important!)
+    desc: 1.5        # Descriptor consistency
+    uncert: 0.5      # Uncertainty calibration
+  
+  repeat_threshold: 3.0  # Max distance in pixels for repeatability
+  desc_margin: 0.2       # Margin for descriptor contrastive loss
+  uncert_type: "mse"     # 'mse' or 'l1'
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 4  # Adjust based on GPU memory (RTX 5070 should handle 4-8)
+  lr: 1e-4
+  lr_min: 1e-6
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  num_workers: 4
+  
+  val_interval: 2     # Validate every N epochs
+  save_interval: 5    # Save checkpoint every N epochs
+  save_dir: "checkpoints"
+
+# Logging configuration
+logging:
+  use_wandb: true
+  project: "semantic-slam-thesis"
+  run_name: "dinov2-heads-v1"
