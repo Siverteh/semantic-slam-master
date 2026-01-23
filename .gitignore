@@ -85,3 +85,5 @@ thesis/*.fdb_latexmk
 thesis/*.fls
 
 ORB_SLAM3
+tum_rgbd/
+tum_rgbd
