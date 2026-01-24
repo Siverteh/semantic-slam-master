@@ -1,6 +1,9 @@
 """
-Frozen DINOv3 Backbone for Semantic SLAM
-FIXED: Proper feature normalization (layer norm + batch norm) per DINOv3 paper
+Fixed DINOv3 Backbone with Grid Alignment
+CRITICAL FIXES from DINO-VO and DINOv3 papers:
+1. Proper 16x16 patch grid alignment
+2. Feature normalization (layer norm + batch norm) to suppress outliers
+3. All coordinates in PATCH space (0-27 for 448x448 input)
 """
 
 import torch
@@ -11,12 +14,12 @@ from typing import Tuple
 
 class DinoBackbone(nn.Module):
     """
-    Wrapper for frozen DINOv3 backbone with proper normalization.
+    Grid-aligned DINOv3 backbone following DINO-VO best practices.
 
-    CRITICAL FIX:
-    - Apply final layer norm to DINOv3 features (handles feature dimension outliers)
-    - Add learned batch normalization (suppresses outlier dimensions)
-    - Per DINOv3 paper Section A.2: "apply final layer norm + batch norm"
+    Key design principles:
+    - 16x16 patches → 28x28 grid for 448x448 input
+    - All coordinates in PATCH space (0-27)
+    - Proper feature normalization per DINOv3 paper
     """
 
     def __init__(
@@ -25,77 +28,81 @@ class DinoBackbone(nn.Module):
         input_size: int = 448,
         freeze: bool = True
     ):
-        """
-        Args:
-            model_name: DINOv3 model variant via timm
-            input_size: Input image size (448 recommended)
-            freeze: Whether to freeze backbone weights
-        """
         super().__init__()
 
         self.model_name = model_name
         self.input_size = input_size
+        self.patch_size = 16  # DINOv3 uses 16x16 patches
 
-        # Load pretrained DINOv3 from timm
-        print(f"Loading {model_name} from timm...")
+        # Grid dimensions
+        self.grid_h = input_size // self.patch_size  # 28
+        self.grid_w = input_size // self.patch_size  # 28
+        self.num_patches = self.grid_h * self.grid_w  # 784
+
+        # Load pretrained DINOv3
+        print(f"Loading {model_name}...")
         self.dino = timm.create_model(
             model_name,
             pretrained=True,
             dynamic_img_size=True
         )
 
-        # Get model info
-        self.patch_size = 16  # DINOv3 uses 16x16 patches
         self.embed_dim = self.dino.embed_dim  # 384 for ViT-S
-        self.num_patches = (input_size // self.patch_size) ** 2  # 28x28 = 784
-        self.grid_size = input_size // self.patch_size  # 28
-        self.n_storage_tokens = 4  # DINOv3 has 4 storage tokens after CLS
+        self.n_storage_tokens = 4  # DINOv3 has 4 storage/register tokens
 
-        # CRITICAL FIX: Add learned batch normalization
-        # Per DINOv3 paper: "applying batch normalization can suppress feature dimension outliers"
-        self.feature_norm = nn.BatchNorm1d(self.embed_dim)
+        # CRITICAL FIX: Add BatchNorm to suppress feature dimension outliers
+        # Per DINOv3 paper Section A.2: "applying batch normalization can suppress
+        # these feature dimension outliers"
+        self.feature_norm = nn.BatchNorm1d(self.embed_dim, affine=True)
 
-        # Freeze backbone if requested
+        # Freeze backbone
         if freeze:
             for param in self.dino.parameters():
                 param.requires_grad = False
             self.dino.eval()
-            print(f"✓ Frozen DINOv3 backbone: {self.embed_dim}D features, {self.grid_size}x{self.grid_size} patches")
-            print(f"✓ Added learned BatchNorm for feature stabilization")
+
+        print(f"✓ DINOv3 Backbone:")
+        print(f"  - Feature dim: {self.embed_dim}")
+        print(f"  - Grid size: {self.grid_h}x{self.grid_w}")
+        print(f"  - Patch size: {self.patch_size}x{self.patch_size}")
+        print(f"  - Coordinate space: PATCH (0-{self.grid_h-1})")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Extract patch features with proper normalization.
+        Extract grid-aligned patch features.
 
         Args:
             images: (B, 3, H, W) RGB images
 
         Returns:
-            patch_features: (B, grid_size, grid_size, embed_dim) normalized spatial features
+            patch_features: (B, grid_h, grid_w, embed_dim)
+                           Features in PATCH coordinate space
         """
         B = images.shape[0]
 
-        # Extract features using forward_features (returns all tokens)
+        # Extract features (with gradient flow only if training unfrozen)
         with torch.set_grad_enabled(self.training and not self._is_frozen()):
             features = self.dino.forward_features(images)
 
-        # features shape: (B, num_tokens, embed_dim)
+        # features: (B, num_tokens, embed_dim)
         # num_tokens = 1 (CLS) + 4 (storage) + num_patches
 
-        # Extract only patch tokens (skip CLS token at index 0 and 4 storage tokens)
-        patch_tokens = features[:, 1 + self.n_storage_tokens:, :]  # (B, num_patches, embed_dim)
+        # Extract patch tokens (skip CLS and storage tokens)
+        patch_tokens = features[:, 1 + self.n_storage_tokens:, :]
 
-        # CRITICAL FIX: Apply final layer normalization (already in model)
-        # Then apply learned batch normalization to suppress outliers
-        # Reshape for BatchNorm: (B, num_patches, C) -> (B*num_patches, C) -> BatchNorm -> reshape back
+        # Verify shape
+        assert patch_tokens.shape[1] == self.num_patches, \
+            f"Expected {self.num_patches} patches, got {patch_tokens.shape[1]}"
+
+        # Apply BatchNorm to suppress outlier dimensions (CRITICAL!)
         B, N, C = patch_tokens.shape
         patch_tokens_flat = patch_tokens.reshape(B * N, C)
         patch_tokens_normed = self.feature_norm(patch_tokens_flat)
         patch_tokens = patch_tokens_normed.reshape(B, N, C)
 
-        # Reshape to spatial grid
+        # Reshape to spatial grid (PATCH coordinates)
         patch_features = patch_tokens.reshape(
-            B, self.grid_size, self.grid_size, self.embed_dim
+            B, self.grid_h, self.grid_w, self.embed_dim
         )
 
         return patch_features
@@ -110,35 +117,62 @@ class DinoBackbone(nn.Module):
         keypoints: torch.Tensor
     ) -> torch.Tensor:
         """
-        Extract features at specific keypoint locations using bilinear sampling.
+        Extract features at keypoint locations using bilinear interpolation.
+
+        CRITICAL: Keypoints MUST be in PATCH coordinates (0 to grid_h-1).
 
         Args:
-            patch_features: (B, H, W, C) feature map
-            keypoints: (B, N, 2) keypoint coordinates in [0, H-1] x [0, W-1]
+            patch_features: (B, H, W, C) feature map in patch space
+            keypoints: (B, N, 2) in PATCH coordinates [0, grid_h-1] x [0, grid_w-1]
 
         Returns:
-            sampled_features: (B, N, C) features at keypoint locations
+            sampled_features: (B, N, C) features at keypoints
         """
         B, H, W, C = patch_features.shape
-        N = keypoints.shape[1]
 
-        # Normalize coordinates to [-1, 1] for grid_sample
+        # Normalize to [-1, 1] for grid_sample
         norm_coords = keypoints.clone()
         norm_coords[:, :, 0] = 2.0 * keypoints[:, :, 0] / (W - 1) - 1.0  # x
         norm_coords[:, :, 1] = 2.0 * keypoints[:, :, 1] / (H - 1) - 1.0  # y
 
-        # Reshape for grid_sample: (B, N, 2) -> (B, 1, N, 2)
-        grid = norm_coords.unsqueeze(1)
+        # Prepare for grid_sample
+        grid = norm_coords.unsqueeze(1)  # (B, 1, N, 2)
+        features_bchw = patch_features.permute(0, 3, 1, 2)  # (B, C, H, W)
 
-        # Permute features for grid_sample: (B, H, W, C) -> (B, C, H, W)
-        features_bhwc = patch_features.permute(0, 3, 1, 2)
-
-        # Sample features at keypoint locations
+        # Sample features
         sampled = torch.nn.functional.grid_sample(
-            features_bhwc, grid, mode='bilinear', align_corners=True
+            features_bchw, grid,
+            mode='bilinear',
+            align_corners=True
         )
 
-        # Reshape output: (B, C, 1, N) -> (B, N, C)
+        # Reshape: (B, C, 1, N) → (B, N, C)
         sampled_features = sampled.squeeze(2).permute(0, 2, 1)
 
         return sampled_features
+
+    def patch_to_pixel(self, patch_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Convert PATCH coordinates to PIXEL coordinates.
+
+        Args:
+            patch_coords: (B, N, 2) in [0, grid_h-1] x [0, grid_w-1]
+
+        Returns:
+            pixel_coords: (B, N, 2) in [0, H-1] x [0, W-1]
+        """
+        pixel_coords = patch_coords * self.patch_size + self.patch_size / 2
+        return pixel_coords
+
+    def pixel_to_patch(self, pixel_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Convert PIXEL coordinates to PATCH coordinates.
+
+        Args:
+            pixel_coords: (B, N, 2) in [0, H-1] x [0, W-1]
+
+        Returns:
+            patch_coords: (B, N, 2) in [0, grid_h-1] x [0, grid_w-1]
+        """
+        patch_coords = (pixel_coords - self.patch_size / 2) / self.patch_size
+        return patch_coords

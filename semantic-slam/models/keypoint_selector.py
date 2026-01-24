@@ -1,6 +1,6 @@
 """
-Keypoint Selector Head
-FIXED: Removed broken softmax, using sigmoid instead
+Fixed Keypoint Selector - CORRECTED VERSION
+CRITICAL FIX: Use sigmoid (not softmax!) for independent per-patch scores
 """
 
 import torch
@@ -11,96 +11,57 @@ from typing import Tuple
 
 class KeypointSelector(nn.Module):
     """
-    Predicts saliency heatmap using spatial attention.
+    Minimal keypoint selector following SuperPoint principles.
 
-    CRITICAL FIX: Uses sigmoid (not softmax!) to allow MULTIPLE peaks.
-    Peakiness loss handles making it focused.
+    CRITICAL: Use SIGMOID for independent per-location scores,
+    NOT softmax which forces single-peak collapse!
     """
 
     def __init__(
         self,
         input_dim: int = 384,
-        hidden_dim: int = 256,
-        num_layers: int = 3
+        hidden_dim: int = 128
     ):
         super().__init__()
 
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-
-        # Step 1: Reduce dimensionality
-        self.proj = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        # Step 2: Spatial attention module
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim // 4, kernel_size=3, padding=1),
+        # SIMPLIFIED: Just 2 conv layers
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 4, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        # Step 3: Feature refinement
-        self.refine = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(inplace=True)
-        )
-
-        # Step 4: Final saliency prediction
-        self.saliency_head = nn.Sequential(
-            nn.Conv2d(hidden_dim // 2, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=1),
-            nn.Sigmoid()  # SIGMOID, not softmax!
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+            # NO activation here - we'll apply sigmoid explicitly
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize with small weights"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.xavier_uniform_(m.weight, gain=0.5)  # Small init
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                    nn.init.constant_(m.bias, 0.0)  # Start neutral
 
     def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
         """
+        Predict per-patch saliency scores.
+
         Args:
-            dino_features: (B, H, W, C) DINOv3 patch features
+            dino_features: (B, H, W, C) in PATCH space
 
         Returns:
-            saliency_map: (B, H, W, 1) keypoint probability map in [0, 1]
+            saliency_map: (B, H, W, 1) scores in [0, 1]
         """
-        # Permute to (B, C, H, W)
+        # Convert to (B, C, H, W)
         x = dino_features.permute(0, 3, 1, 2)
 
-        # Project to lower dimension
-        x = self.proj(x)
+        # Predict logits
+        logits = self.conv(x)  # (B, 1, H, W)
 
-        # Compute spatial attention
-        attn = self.spatial_attention(x)
+        # Apply SIGMOID (not softmax!)
+        # Each location is INDEPENDENT
+        saliency = torch.sigmoid(logits)
 
-        # Apply attention
-        x = x * attn
-
-        # Refine features
-        x = self.refine(x)
-
-        # Predict saliency (sigmoid gives independent probabilities per location)
-        saliency = self.saliency_head(x)  # (B, 1, H, W) in [0, 1]
-
-        # Permute back to (B, H, W, 1)
+        # Convert back to (B, H, W, 1)
         saliency_map = saliency.permute(0, 2, 3, 1)
 
         return saliency_map
@@ -110,19 +71,19 @@ class KeypointSelector(nn.Module):
         saliency_map: torch.Tensor,
         num_keypoints: int = 500,
         nms_radius: int = 2,
-        threshold: float = 0.01
+        score_threshold: float = 0.01
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Select top keypoints from saliency map.
+        Select keypoints with NMS.
 
         Args:
-            saliency_map: (B, H, W, 1) saliency heatmap
-            num_keypoints: Maximum number of keypoints to select
-            nms_radius: Radius for non-maximum suppression
-            threshold: Minimum saliency threshold
+            saliency_map: (B, H, W, 1) independent scores
+            num_keypoints: Target number of keypoints
+            nms_radius: NMS radius
+            score_threshold: Minimum score
 
         Returns:
-            keypoints: (B, N, 2) keypoint coordinates
+            keypoints: (B, N, 2) in PATCH coordinates
             scores: (B, N) saliency scores
         """
         B, H, W, _ = saliency_map.shape
@@ -130,12 +91,16 @@ class KeypointSelector(nn.Module):
 
         saliency = saliency_map.squeeze(-1)  # (B, H, W)
 
-        # Apply NMS
+        # Apply NMS to get local maxima
         if nms_radius > 0:
             saliency = self._apply_nms(saliency, nms_radius)
 
         # Threshold
-        saliency = torch.where(saliency > threshold, saliency, torch.zeros_like(saliency))
+        saliency = torch.where(
+            saliency > score_threshold,
+            saliency,
+            torch.zeros_like(saliency)
+        )
 
         keypoints_list = []
         scores_list = []
@@ -143,46 +108,45 @@ class KeypointSelector(nn.Module):
         for b in range(B):
             sal_b = saliency[b]
 
-            # Get valid coordinates
+            # Get valid points
             valid_mask = sal_b > 0
             valid_scores = sal_b[valid_mask]
-            valid_coords = torch.nonzero(valid_mask)  # (N_valid, 2) as (y, x)
 
             if len(valid_scores) == 0:
-                # Fallback: uniform grid
-                grid_size = int(num_keypoints ** 0.5)
-                y_grid = torch.linspace(2, H-3, grid_size, device=device)
-                x_grid = torch.linspace(2, W-3, grid_size, device=device)
-                yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
-                kpts = torch.stack([xx.flatten(), yy.flatten()], dim=1).float()
-                scrs = torch.ones(len(kpts), device=device) * 0.1
+                # Fallback: Use top-k from raw saliency
+                sal_flat = sal_b.flatten()
+                top_scores, top_indices = torch.topk(sal_flat, min(num_keypoints, len(sal_flat)))
+
+                y_coords = top_indices // W
+                x_coords = top_indices % W
+
+                kpts = torch.stack([x_coords, y_coords], dim=1).float()
+                scrs = top_scores
             else:
+                # Get coordinates
+                valid_coords = torch.nonzero(valid_mask, as_tuple=False)
+
                 # Select top-k by score
                 k = min(num_keypoints, len(valid_scores))
                 top_scores, top_indices = torch.topk(valid_scores, k)
                 top_coords = valid_coords[top_indices]
 
-                # Convert to (x, y) format
+                # Convert to (x, y)
                 kpts = torch.stack([top_coords[:, 1], top_coords[:, 0]], dim=1).float()
                 scrs = top_scores
 
-            # Padding if needed
+            # Pad if needed
             if len(kpts) < num_keypoints:
                 pad_size = num_keypoints - len(kpts)
-
-                # Use grid sampling for padding (not random, not duplicates)
-                grid_size = int(pad_size ** 0.5) + 1
-                y_pad = torch.linspace(2, H-3, grid_size, device=device)
-                x_pad = torch.linspace(2, W-3, grid_size, device=device)
-                yy_pad, xx_pad = torch.meshgrid(y_pad, x_pad, indexing='ij')
-                pad_kpts = torch.stack([xx_pad.flatten(), yy_pad.flatten()], dim=1).float()[:pad_size]
-                pad_scrs = torch.ones(pad_size, device=device) * 1e-6
-
+                # Use low-score fallback points
+                pad_kpts, pad_scrs = self._uniform_grid_keypoints(
+                    H, W, pad_size, device
+                )
                 kpts = torch.cat([kpts, pad_kpts], dim=0)
                 scrs = torch.cat([scrs, pad_scrs], dim=0)
 
-            keypoints_list.append(kpts)
-            scores_list.append(scrs)
+            keypoints_list.append(kpts[:num_keypoints])
+            scores_list.append(scrs[:num_keypoints])
 
         keypoints = torch.stack(keypoints_list, dim=0)
         scores = torch.stack(scores_list, dim=0)
@@ -190,7 +154,7 @@ class KeypointSelector(nn.Module):
         return keypoints, scores
 
     def _apply_nms(self, saliency: torch.Tensor, radius: int) -> torch.Tensor:
-        """Apply non-maximum suppression"""
+        """Non-maximum suppression"""
         kernel_size = 2 * radius + 1
         max_pooled = F.max_pool2d(
             saliency.unsqueeze(1),
@@ -199,7 +163,26 @@ class KeypointSelector(nn.Module):
             padding=radius
         ).squeeze(1)
 
+        # Keep only local maxima
         nms_mask = (saliency == max_pooled)
         nms_saliency = saliency * nms_mask.float()
 
         return nms_saliency
+
+    def _uniform_grid_keypoints(
+        self,
+        H: int,
+        W: int,
+        num_keypoints: int,
+        device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Uniform grid fallback"""
+        grid_size = int(num_keypoints ** 0.5) + 1
+        y_grid = torch.linspace(1, H-2, grid_size, device=device)
+        x_grid = torch.linspace(1, W-2, grid_size, device=device)
+        yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
+
+        kpts = torch.stack([xx.flatten(), yy.flatten()], dim=1)[:num_keypoints]
+        scores = torch.ones(len(kpts), device=device) * 0.001  # Very low score
+
+        return kpts, scores

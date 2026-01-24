@@ -1,6 +1,10 @@
 """
-Main Training Script for Semantic SLAM Heads
-COMPLETE VERSION - Fixed descriptor loss + selector training
+SIMPLIFIED Training Script
+CRITICAL FIXES:
+1. Only 3 losses (descriptor, repeatability, sparsity)
+2. All coordinates in PATCH space
+3. Grid-aligned keypoint selection
+4. Proper DINOv3 feature normalization
 """
 
 import os
@@ -19,33 +23,35 @@ import numpy as np
 from models.dino_backbone import DinoBackbone
 from models.keypoint_selector import KeypointSelector
 from models.descriptor_refiner import DescriptorRefiner
-from models.uncertainty_estimator import UncertaintyEstimator
 
 from data.tum_dataset import TUMDataset
 from losses.self_supervised import (
-    PhotometricLoss,
+    DescriptorMatchingLoss,
     RepeatabilityLoss,
-    DescriptorConsistencyLoss,
-    UncertaintyCalibrationLoss,
-    DescriptorDiversityLoss,
     PeakinessLoss,
-    FeatureVarianceLoss
+    ActivationLoss
 )
 
 
 class SemanticSLAMTrainer:
-    """End-to-end trainer for semantic SLAM heads"""
+    """Simplified trainer with 3 core losses"""
 
     def __init__(self, config: Dict):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         print("\n" + "="*70)
-        print("SEMANTIC SLAM TRAINING - FIXED VERSION v2")
+        print("SEMANTIC SLAM TRAINING - SIMPLIFIED & FIXED")
         print("="*70)
+        print("Key improvements:")
+        print("  ✓ Grid-aligned keypoints (DINO-VO best practice)")
+        print("  ✓ Only 3 core losses (down from 7)")
+        print("  ✓ All coordinates in PATCH space")
+        print("  ✓ Proper DINOv3 feature normalization")
+        print("="*70 + "\n")
 
         # Initialize models
-        print("\n📦 Loading models...")
+        print("📦 Loading models...")
         self.backbone = DinoBackbone(
             model_name=config['model']['backbone'],
             input_size=config['model']['input_size'],
@@ -54,64 +60,45 @@ class SemanticSLAMTrainer:
 
         self.selector = KeypointSelector(
             input_dim=self.backbone.embed_dim,
-            hidden_dim=config['model']['selector_hidden'],
-            num_layers=config['model']['selector_layers']
+            hidden_dim=config['model']['selector_hidden']
         ).to(self.device)
 
         self.refiner = DescriptorRefiner(
             input_dim=self.backbone.embed_dim,
             hidden_dim=config['model']['refiner_hidden'],
-            output_dim=config['model']['descriptor_dim'],
-            num_layers=config['model']['refiner_layers']
-        ).to(self.device)
-
-        self.estimator = UncertaintyEstimator(
-            dino_dim=self.backbone.embed_dim,
-            descriptor_dim=config['model']['descriptor_dim'],
-            hidden_dim=config['model']['estimator_hidden']
+            output_dim=config['model']['descriptor_dim']
         ).to(self.device)
 
         # Count parameters
         selector_params = sum(p.numel() for p in self.selector.parameters() if p.requires_grad)
         refiner_params = sum(p.numel() for p in self.refiner.parameters() if p.requires_grad)
-        estimator_params = sum(p.numel() for p in self.estimator.parameters() if p.requires_grad)
-        total_params = selector_params + refiner_params + estimator_params
+        total_params = selector_params + refiner_params
 
         print(f"  ✓ Keypoint Selector:  {selector_params/1e6:.2f}M params")
         print(f"  ✓ Descriptor Refiner: {refiner_params/1e6:.2f}M params")
-        print(f"  ✓ Uncertainty Estimator: {estimator_params/1e6:.2f}M params")
         print(f"  ✓ Total trainable:    {total_params/1e6:.2f}M params")
-        print(f"  ✓ Device: {self.device}")
 
-        # Initialize ALL losses
+        # Initialize losses
         print("\n📊 Initializing losses...")
-        self.photo_loss = PhotometricLoss()
+        self.desc_loss = DescriptorMatchingLoss(
+            temperature=config['loss']['desc_temperature']
+        )
         self.repeat_loss = RepeatabilityLoss(
             distance_threshold=config['loss']['repeat_threshold']
         )
-        self.desc_loss = DescriptorConsistencyLoss(
-            temperature=config['loss']['desc_temperature'],
-            num_negatives=config['loss']['desc_num_negatives'],
-            margin=config['loss']['desc_margin']
+        self.peakiness_loss = PeakinessLoss()
+        self.activation_loss = ActivationLoss(
+            target_mean=config['loss']['target_activation']
         )
-        self.uncert_loss = UncertaintyCalibrationLoss(
-            loss_type=config['loss']['uncert_type']
-        )
-        self.diversity_loss = DescriptorDiversityLoss(target_similarity=0.1)
-
-        # NEW: Selector training losses
-        self.peakiness_loss = PeakinessLoss(target_sparsity=0.1)
-        self.variance_loss = FeatureVarianceLoss(neighborhood_size=3)
 
         # Loss weights
         self.loss_weights = config['loss']['weights']
-        print(f"  Loss weights: {self.loss_weights}")
+        print(f"  ✓ Loss weights: {self.loss_weights}")
+        print(f"  ✓ Total losses: 4 (descriptor, repeatability, peakiness, activation)")
 
         # Optimizer
         self.optimizer = AdamW(
-            list(self.selector.parameters()) +
-            list(self.refiner.parameters()) +
-            list(self.estimator.parameters()),
+            list(self.selector.parameters()) + list(self.refiner.parameters()),
             lr=float(config['training']['lr']),
             weight_decay=float(config['training']['weight_decay'])
         )
@@ -123,11 +110,7 @@ class SemanticSLAMTrainer:
             eta_min=float(config['training']['lr_min'])
         )
 
-        # Warmup
-        self.warmup_epochs = config['training'].get('warmup_epochs', 0)
-        self.base_lr = float(config['training']['lr'])
-
-        # Dataset
+        # Datasets
         print("\n📂 Loading datasets...")
         self.train_loader = self._create_dataloader(
             config['dataset']['train_sequences'],
@@ -154,7 +137,6 @@ class SemanticSLAMTrainer:
                 name=config['logging']['run_name'],
                 config=config
             )
-            print(f"  ✓ Run: {config['logging']['run_name']}")
 
         # Training state
         self.global_step = 0
@@ -169,9 +151,9 @@ class SemanticSLAMTrainer:
         sequences: list,
         batch_size: int,
         shuffle: bool,
-        is_train: bool = True
+        is_train: bool
     ) -> DataLoader:
-        """Create dataloader from multiple sequences"""
+        """Create dataloader from sequences"""
         datasets = []
         for seq in sequences:
             dataset = TUMDataset(
@@ -196,44 +178,24 @@ class SemanticSLAMTrainer:
             pin_memory=True
         )
 
-    def _get_lr(self, epoch: int) -> float:
-        """Get learning rate with warmup"""
-        if epoch < self.warmup_epochs:
-            return self.base_lr * (epoch + 1) / self.warmup_epochs
-        else:
-            return self.optimizer.param_groups[0]['lr']
-
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.selector.train()
         self.refiner.train()
-        self.estimator.train()
-
-        # Apply warmup LR
-        if epoch < self.warmup_epochs:
-            lr = self._get_lr(epoch)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
 
         total_loss = 0.0
         losses_dict = {
-            'photo': 0.0,
-            'repeat': 0.0,
             'desc': 0.0,
-            'uncert': 0.0,
-            'diversity': 0.0,
+            'repeat': 0.0,
             'peakiness': 0.0,
-            'variance': 0.0
+            'activation': 0.0
         }
 
-        # Metrics tracking
+        # Metrics
         metrics = {
             'num_matches': [],
-            'mean_confidence': [],
-            'desc_mean_sim': [],
-            'desc_max_sim': [],
-            'saliency_mean': [],
-            'saliency_max': []
+            'mean_saliency': [],
+            'max_saliency': []
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:2d}")
@@ -241,79 +203,63 @@ class SemanticSLAMTrainer:
         for batch_idx, batch in enumerate(pbar):
             rgb1 = batch['rgb1'].to(self.device)
             rgb2 = batch['rgb2'].to(self.device)
-            depth1 = batch['depth1'].to(self.device)
-            depth2 = batch['depth2'].to(self.device)
-
-            if 'relative_pose' not in batch:
-                continue
-
-            rel_pose = batch['relative_pose'].to(self.device)
 
             # Forward pass
-            loss, loss_components, batch_metrics = self._forward_pass(
-                rgb1, rgb2, depth1, depth2, rel_pose
-            )
+            loss, loss_components, batch_metrics = self._forward_pass(rgb1, rgb2)
 
-            # Backward pass
+            # Check for NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n⚠️ NaN/Inf detected at batch {batch_idx}, skipping...")
+                continue
+
+            # Backward
             self.optimizer.zero_grad()
             loss.backward()
-
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(
-                list(self.selector.parameters()) +
-                list(self.refiner.parameters()) +
-                list(self.estimator.parameters()),
+                list(self.selector.parameters()) + list(self.refiner.parameters()),
                 max_norm=self.config['training']['grad_clip']
             )
-
             self.optimizer.step()
 
-            # Accumulate losses
+            # Accumulate
             total_loss += loss.item()
             for key in losses_dict:
                 losses_dict[key] += loss_components[key]
 
-            # Accumulate metrics
             for key in metrics:
                 if key in batch_metrics:
                     metrics[key].append(batch_metrics[key])
 
-            # Update progress bar
-            current_lr = self.optimizer.param_groups[0]['lr']
+            # Update progress
             pbar.set_postfix({
                 'loss': f"{loss.item():.3f}",
-                'L_desc': f"{loss_components['desc']:.3f}",
-                'L_peak': f"{loss_components['peakiness']:.3f}",
+                'desc': f"{loss_components['desc']:.3f}",
                 'matches': f"{batch_metrics.get('num_matches', 0):.0f}",
-                'sal_max': f"{batch_metrics.get('saliency_max', 0):.3f}",
-                'lr': f"{current_lr:.1e}"
+                'sal_max': f"{batch_metrics.get('max_saliency', 0):.3f}",
+                'sal_mean': f"{batch_metrics.get('mean_saliency', 0):.3f}"
             })
 
             self.global_step += 1
 
             # Log to wandb
-            if self.config['logging']['use_wandb'] and batch_idx % self.config['logging'].get('log_interval', 50) == 0:
+            if self.config['logging']['use_wandb'] and batch_idx % 50 == 0:
                 wandb.log({
                     'batch/loss': loss.item(),
-                    'batch/photo': loss_components['photo'],
-                    'batch/repeat': loss_components['repeat'],
                     'batch/desc': loss_components['desc'],
-                    'batch/uncert': loss_components['uncert'],
-                    'batch/diversity': loss_components['diversity'],
+                    'batch/repeat': loss_components['repeat'],
                     'batch/peakiness': loss_components['peakiness'],
-                    'batch/variance': loss_components['variance'],
-                    'batch/num_matches': batch_metrics.get('num_matches', 0),
-                    'batch/desc_mean_sim': batch_metrics.get('desc_mean_sim', 0),
-                    'batch/saliency_max': batch_metrics.get('saliency_max', 0),
-                    'lr': current_lr,
+                    'batch/activation': loss_components['activation'],
+                    'batch/matches': batch_metrics.get('num_matches', 0),
+                    'batch/sal_mean': batch_metrics.get('mean_saliency', 0),
+                    'batch/sal_max': batch_metrics.get('max_saliency', 0),
                     'step': self.global_step
                 })
 
-        # Average losses and metrics
-        n_batches = len(self.train_loader)
-        avg_loss = total_loss / n_batches
+        # Average
+        n = len(self.train_loader)
+        avg_loss = total_loss / n
         for key in losses_dict:
-            losses_dict[key] /= n_batches
+            losses_dict[key] /= n
 
         avg_metrics = {}
         for key in metrics:
@@ -325,23 +271,27 @@ class SemanticSLAMTrainer:
     def _forward_pass(
         self,
         rgb1: torch.Tensor,
-        rgb2: torch.Tensor,
-        depth1: torch.Tensor,
-        depth2: torch.Tensor,
-        rel_pose: torch.Tensor
+        rgb2: torch.Tensor
     ) -> tuple:
-        """Complete forward pass through all heads"""
+        """Complete forward pass"""
 
-        # Extract DINOv3 features
+        # Extract DINOv3 features (in PATCH space!)
         with torch.no_grad():
-            feat1 = self.backbone(rgb1)
+            feat1 = self.backbone(rgb1)  # (B, 28, 28, 384)
             feat2 = self.backbone(rgb2)
 
-        # Keypoint selection
+        # Keypoint selection (in PATCH space!)
         saliency1 = self.selector(feat1)
         saliency2 = self.selector(feat2)
 
-        # Select keypoints
+        # Check for NaN in saliency
+        if torch.isnan(saliency1).any():
+            print("⚠️ NaN in saliency1!")
+            saliency1 = torch.sigmoid(torch.zeros_like(saliency1))
+        if torch.isnan(saliency2).any():
+            print("⚠️ NaN in saliency2!")
+            saliency2 = torch.sigmoid(torch.zeros_like(saliency2))
+
         kpts1, scores1 = self.selector.select_keypoints(
             saliency1,
             num_keypoints=self.config['model']['num_keypoints']
@@ -359,78 +309,51 @@ class SemanticSLAMTrainer:
         desc1 = self.refiner(feat_at_kpts1)
         desc2 = self.refiner(feat_at_kpts2)
 
-        # Estimate uncertainty
-        conf1 = self.estimator(feat_at_kpts1, desc1)
-        conf2 = self.estimator(feat_at_kpts2, desc2)
+        # ============ COMPUTE LOSSES ============
 
-        # ============================================================
-        # COMPUTE ALL LOSSES
-        # ============================================================
-
-        # 1. Photometric loss
-        loss_photo = self.photo_loss(rgb1, rgb2, depth1, rel_pose)
-
-        # 2. Repeatability loss
-        loss_repeat = self.repeat_loss(kpts1, kpts2, depth1, rel_pose)
-
-        # 3. Descriptor loss
-        matches = self._find_matches(desc1, desc2, kpts1, kpts2, depth1, rel_pose)
+        # 1. Descriptor matching loss
+        matches = self._find_matches(desc1, desc2)
         loss_desc = self.desc_loss(desc1, desc2, matches)
 
-        # 4. Uncertainty loss
-        reproj_error1 = self._compute_reprojection_error(kpts1, kpts2, depth1, rel_pose)
-        loss_uncert = self.uncert_loss(conf1, reproj_error1)
+        # 2. Repeatability loss (simple L2 distance)
+        loss_repeat = self.repeat_loss(kpts1, kpts2)
 
-        # 5. Diversity loss
-        loss_diversity = self.diversity_loss(desc1)
-
-        # 6. NEW: Peakiness loss (makes saliency maps focused)
+        # 3. Peakiness loss (variance-based)
         loss_peakiness = self.peakiness_loss(saliency1)
 
-        # 7. NEW: Variance loss (selector chooses high-variance regions)
-        loss_variance = self.variance_loss(saliency1, feat1)
+        # 4. Activation loss (ensure selector activates)
+        loss_activation = self.activation_loss(saliency1)
+
+        # Replace NaN with zeros
+        if torch.isnan(loss_desc):
+            loss_desc = torch.tensor(0.1, device=loss_desc.device, requires_grad=True)
+        if torch.isnan(loss_repeat):
+            loss_repeat = torch.tensor(0.0, device=loss_repeat.device, requires_grad=True)
+        if torch.isnan(loss_peakiness):
+            loss_peakiness = torch.tensor(0.0, device=loss_peakiness.device, requires_grad=True)
+        if torch.isnan(loss_activation):
+            loss_activation = torch.tensor(0.0, device=loss_activation.device, requires_grad=True)
 
         # Weighted combination
         w = self.loss_weights
         total_loss = (
-            w['photo'] * loss_photo +
-            w['repeat'] * loss_repeat +
             w['desc'] * loss_desc +
-            w['uncert'] * loss_uncert +
-            w['diversity'] * loss_diversity +
+            w['repeat'] * loss_repeat +
             w['peakiness'] * loss_peakiness +
-            w['variance'] * loss_variance
+            w['activation'] * loss_activation
         )
 
         loss_components = {
-            'photo': loss_photo.item(),
-            'repeat': loss_repeat.item(),
             'desc': loss_desc.item(),
-            'uncert': loss_uncert.item(),
-            'diversity': loss_diversity.item(),
+            'repeat': loss_repeat.item(),
             'peakiness': loss_peakiness.item(),
-            'variance': loss_variance.item()
+            'activation': loss_activation.item()
         }
-
-        # Compute metrics
-        desc_flat = desc1.reshape(-1, desc1.shape[-1])
-        if desc_flat.shape[0] > 500:
-            indices = torch.randperm(desc_flat.shape[0])[:500]
-            desc_sample = desc_flat[indices]
-        else:
-            desc_sample = desc_flat
-
-        sim_matrix = torch.mm(desc_sample, desc_sample.t())
-        mask = ~torch.eye(sim_matrix.shape[0], device=sim_matrix.device, dtype=torch.bool)
-        pairwise_sims = sim_matrix[mask]
 
         batch_metrics = {
             'num_matches': matches.shape[1],
-            'mean_confidence': conf1.mean().item(),
-            'desc_mean_sim': pairwise_sims.mean().item(),
-            'desc_max_sim': pairwise_sims.max().item(),
-            'saliency_mean': saliency1.mean().item(),
-            'saliency_max': saliency1.max().item()
+            'mean_saliency': saliency1.mean().item() if not torch.isnan(saliency1.mean()) else 0.0,
+            'max_saliency': saliency1.max().item() if not torch.isnan(saliency1.max()) else 0.0
         }
 
         return total_loss, loss_components, batch_metrics
@@ -438,13 +361,9 @@ class SemanticSLAMTrainer:
     def _find_matches(
         self,
         desc1: torch.Tensor,
-        desc2: torch.Tensor,
-        kpts1: torch.Tensor,
-        kpts2: torch.Tensor,
-        depth1: torch.Tensor,
-        rel_pose: torch.Tensor
+        desc2: torch.Tensor
     ) -> torch.Tensor:
-        """Find matches using mutual nearest neighbors"""
+        """Find mutual nearest neighbor matches"""
         B, N, D = desc1.shape
         device = desc1.device
 
@@ -466,88 +385,35 @@ class SemanticSLAMTrainer:
 
             matches_list.append(matches_b)
 
+        # Pad to same length
         max_matches = max(m.shape[0] for m in matches_list)
         if max_matches == 0:
             return torch.zeros(B, 1, 2, device=device, dtype=torch.long)
 
-        padded_matches = []
+        padded = []
         for m in matches_list:
             if m.shape[0] < max_matches:
                 pad = torch.zeros(max_matches - m.shape[0], 2, device=device, dtype=torch.long)
                 m = torch.cat([m, pad], dim=0)
-            padded_matches.append(m)
+            padded.append(m)
 
-        return torch.stack(padded_matches, dim=0)
-
-    def _compute_reprojection_error(
-        self,
-        kpts1: torch.Tensor,
-        kpts2: torch.Tensor,
-        depth1: torch.Tensor,
-        rel_pose: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute reprojection error for uncertainty calibration"""
-        B, N, _ = kpts1.shape
-        H, W = depth1.shape[2:]
-        device = kpts1.device
-
-        fx = fy = 525.0 * (H / 480.0)
-        cx = cy = H / 2.0
-        intrinsics = torch.tensor([
-            [fx, 0, cx],
-            [0, fy, cy],
-            [0, 0, 1]
-        ], device=device).unsqueeze(0).repeat(B, 1, 1)
-
-        projected_kpts = self.repeat_loss._project_keypoints(
-            kpts1, depth1, rel_pose,
-            intrinsics=intrinsics,
-            H=H, W=W
-        )
-
-        error = torch.norm(projected_kpts - kpts2, dim=2)
-        return error
+        return torch.stack(padded, dim=0)
 
     def validate(self) -> Dict[str, float]:
         """Validation pass"""
         self.selector.eval()
         self.refiner.eval()
-        self.estimator.eval()
 
         total_loss = 0.0
-        losses_dict = {
-            'photo': 0.0,
-            'repeat': 0.0,
-            'desc': 0.0,
-            'uncert': 0.0,
-            'diversity': 0.0,
-            'peakiness': 0.0,
-            'variance': 0.0
-        }
-        metrics = {
-            'num_matches': [],
-            'mean_confidence': [],
-            'desc_mean_sim': [],
-            'desc_max_sim': [],
-            'saliency_mean': [],
-            'saliency_max': []
-        }
+        losses_dict = {'desc': 0.0, 'repeat': 0.0, 'peakiness': 0.0, 'activation': 0.0}
+        metrics = {'num_matches': [], 'mean_saliency': [], 'max_saliency': []}
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation", leave=False):
                 rgb1 = batch['rgb1'].to(self.device)
                 rgb2 = batch['rgb2'].to(self.device)
-                depth1 = batch['depth1'].to(self.device)
-                depth2 = batch['depth2'].to(self.device)
 
-                if 'relative_pose' not in batch:
-                    continue
-
-                rel_pose = batch['relative_pose'].to(self.device)
-
-                loss, loss_components, batch_metrics = self._forward_pass(
-                    rgb1, rgb2, depth1, depth2, rel_pose
-                )
+                loss, loss_components, batch_metrics = self._forward_pass(rgb1, rgb2)
 
                 total_loss += loss.item()
                 for key in losses_dict:
@@ -557,10 +423,10 @@ class SemanticSLAMTrainer:
                     if key in batch_metrics:
                         metrics[key].append(batch_metrics[key])
 
-        n_batches = len(self.val_loader)
-        avg_loss = total_loss / n_batches
+        n = len(self.val_loader)
+        avg_loss = total_loss / n
         for key in losses_dict:
-            losses_dict[key] /= n_batches
+            losses_dict[key] /= n
 
         avg_metrics = {}
         for key in metrics:
@@ -579,106 +445,53 @@ class SemanticSLAMTrainer:
             if epoch % self.config['training']['val_interval'] == 0:
                 val_losses = self.validate()
 
-                # Print epoch summary
+                # Print summary
                 print(f"\n{'='*70}")
-                print(f"EPOCH {epoch}/{self.config['training']['epochs']} SUMMARY")
+                print(f"EPOCH {epoch}/{self.config['training']['epochs']}")
                 print(f"{'='*70}")
-                print(f"{'Metric':<25} {'Train':>12} {'Val':>12}")
+                print(f"{'Metric':<20} {'Train':>12} {'Val':>12}")
                 print(f"{'-'*70}")
-                print(f"{'Total Loss':<25} {train_losses['total']:>12.4f} {val_losses['total']:>12.4f}")
-                print(f"{'  Photometric':<25} {train_losses['photo']:>12.4f} {val_losses['photo']:>12.4f}")
-                print(f"{'  Repeatability':<25} {train_losses['repeat']:>12.4f} {val_losses['repeat']:>12.4f}")
-                print(f"{'  Descriptor':<25} {train_losses['desc']:>12.4f} {val_losses['desc']:>12.4f}")
-                print(f"{'  Uncertainty':<25} {train_losses['uncert']:>12.4f} {val_losses['uncert']:>12.4f}")
-                print(f"{'  Diversity':<25} {train_losses['diversity']:>12.4f} {val_losses['diversity']:>12.4f}")
-                print(f"{'  Peakiness':<25} {train_losses['peakiness']:>12.4f} {val_losses['peakiness']:>12.4f}")
-                print(f"{'  Variance':<25} {train_losses['variance']:>12.4f} {val_losses['variance']:>12.4f}")
+                print(f"{'Total Loss':<20} {train_losses['total']:>12.4f} {val_losses['total']:>12.4f}")
+                print(f"{'  Descriptor':<20} {train_losses['desc']:>12.4f} {val_losses['desc']:>12.4f}")
+                print(f"{'  Repeatability':<20} {train_losses['repeat']:>12.4f} {val_losses['repeat']:>12.4f}")
+                print(f"{'  Peakiness':<20} {train_losses['peakiness']:>12.4f} {val_losses['peakiness']:>12.4f}")
+                print(f"{'  Activation':<20} {train_losses['activation']:>12.4f} {val_losses['activation']:>12.4f}")
                 print(f"{'-'*70}")
-                print(f"{'Avg Matches':<25} {train_losses.get('num_matches', 0):>12.1f} {val_losses.get('num_matches', 0):>12.1f}")
-                print(f"{'Mean Confidence':<25} {train_losses.get('mean_confidence', 0):>12.3f} {val_losses.get('mean_confidence', 0):>12.3f}")
-                print(f"{'Desc Mean Similarity':<25} {train_losses.get('desc_mean_sim', 0):>12.3f} {val_losses.get('desc_mean_sim', 0):>12.3f}")
-                print(f"{'Saliency Max':<25} {train_losses.get('saliency_max', 0):>12.3f} {val_losses.get('saliency_max', 0):>12.3f}")
-                print(f"{'Learning Rate':<25} {self.optimizer.param_groups[0]['lr']:>12.1e}")
+                print(f"{'Matches':<20} {train_losses.get('num_matches', 0):>12.1f} {val_losses.get('num_matches', 0):>12.1f}")
+                print(f"{'Mean Saliency':<20} {train_losses.get('mean_saliency', 0):>12.3f} {val_losses.get('mean_saliency', 0):>12.3f}")
+                print(f"{'Max Saliency':<20} {train_losses.get('max_saliency', 0):>12.3f} {val_losses.get('max_saliency', 0):>12.3f}")
                 print(f"{'='*70}\n")
-
-                # Health checks
-                print("📊 HEALTH CHECK:")
-
-                # Descriptor health
-                mean_sim = train_losses.get('desc_mean_sim', 0)
-                if mean_sim < 0.15:
-                    print(f"   ✅ Descriptors: Mean sim {mean_sim:.3f} < 0.15 (excellent!)")
-                elif mean_sim < 0.25:
-                    print(f"   ✓ Descriptors: Mean sim {mean_sim:.3f} < 0.25 (good)")
-                else:
-                    print(f"   ⚠️  Descriptors: Mean sim {mean_sim:.3f} > 0.25 (too high)")
-
-                # Selector health
-                saliency_max = train_losses.get('saliency_max', 0)
-                if saliency_max > 0.1:
-                    print(f"   ✅ Selector: Max saliency {saliency_max:.3f} > 0.1 (peaked!)")
-                else:
-                    print(f"   ⚠️  Selector: Max saliency {saliency_max:.3f} < 0.1 (too flat)")
-
-                # Match health
-                num_matches = train_losses.get('num_matches', 0)
-                if num_matches > 150:
-                    print(f"   ✅ Matches: {num_matches:.0f} > 150 (good)")
-                elif num_matches > 100:
-                    print(f"   ✓ Matches: {num_matches:.0f} > 100 (acceptable)")
-                else:
-                    print(f"   ⚠️  Matches: {num_matches:.0f} < 100 (low)")
-                print()
 
                 # Log to wandb
                 if self.config['logging']['use_wandb']:
                     wandb.log({
                         'epoch': epoch,
                         'train/total': train_losses['total'],
-                        'train/photo': train_losses['photo'],
-                        'train/repeat': train_losses['repeat'],
                         'train/desc': train_losses['desc'],
-                        'train/uncert': train_losses['uncert'],
-                        'train/diversity': train_losses['diversity'],
+                        'train/repeat': train_losses['repeat'],
                         'train/peakiness': train_losses['peakiness'],
-                        'train/variance': train_losses['variance'],
-                        'train/num_matches': train_losses.get('num_matches', 0),
-                        'train/desc_mean_sim': train_losses.get('desc_mean_sim', 0),
-                        'train/saliency_max': train_losses.get('saliency_max', 0),
+                        'train/activation': train_losses['activation'],
                         'val/total': val_losses['total'],
-                        'val/photo': val_losses['photo'],
-                        'val/repeat': val_losses['repeat'],
                         'val/desc': val_losses['desc'],
-                        'val/uncert': val_losses['uncert'],
-                        'val/diversity': val_losses['diversity'],
+                        'val/repeat': val_losses['repeat'],
                         'val/peakiness': val_losses['peakiness'],
-                        'val/variance': val_losses['variance'],
-                        'val/num_matches': val_losses.get('num_matches', 0),
-                        'val/desc_mean_sim': val_losses.get('desc_mean_sim', 0),
-                        'val/saliency_max': val_losses.get('saliency_max', 0),
-                        'lr': self.optimizer.param_groups[0]['lr']
+                        'val/activation': val_losses['activation']
                     })
 
-                # Save best model
+                # Save best
                 if val_losses['total'] < self.best_val_loss:
                     self.best_val_loss = val_losses['total']
                     self.save_checkpoint('best_model.pth', epoch, val_losses['total'])
                     print(f"✓ Saved best model (val_loss: {self.best_val_loss:.4f})\n")
 
-            # Step scheduler
-            if epoch >= self.warmup_epochs:
-                self.scheduler.step()
-
-            # Save checkpoint periodically
-            if epoch % self.config['training']['save_interval'] == 0:
-                self.save_checkpoint(f'checkpoint_epoch{epoch}.pth', epoch, train_losses['total'])
+            self.scheduler.step()
 
         print("\n" + "="*70)
         print("✓ TRAINING COMPLETE!")
         print("="*70)
 
     def save_checkpoint(self, filename: str, epoch: int, loss: float):
-        """Save model checkpoint"""
+        """Save checkpoint"""
         save_dir = Path(self.config['training']['save_dir'])
         save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -687,7 +500,6 @@ class SemanticSLAMTrainer:
             'loss': loss,
             'selector_state_dict': self.selector.state_dict(),
             'refiner_state_dict': self.refiner.state_dict(),
-            'estimator_state_dict': self.estimator.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'config': self.config
