@@ -3,22 +3,18 @@
 # Model architecture
 model:
   backbone: "vit_small_patch16_dinov3.lvd1689m"  # DINOv3-ViT-S (384-dim, 22M params)
-  # Other options:
-  # - vit_base_patch16_dinov3.lvd1689m   # 768-dim, 86M params (slower)
-  # - vit_large_patch16_dinov3.lvd1689m  # 1024-dim, 304M params (much slower)
-  
-  input_size: 448  # Image resolution (448 -> 28x28 patches with 16x16 patch size)
+  input_size: 448  # Image resolution (448 -> 28x28 patches)
   num_keypoints: 500  # Number of keypoints to select
-  
+
   # Keypoint Selector Head
   selector_hidden: 256
   selector_layers: 3
-  
+
   # Descriptor Refiner Head
   descriptor_dim: 128  # Output descriptor dimension
   refiner_hidden: 256
   refiner_layers: 3
-  
+
   # Uncertainty Estimator Head
   estimator_hidden: 128
 
@@ -31,31 +27,44 @@ dataset:
   val_sequences:
     - "rgbd_dataset_freiburg1_plant"    # Low texture validation
   frame_spacing: 1  # Spacing between consecutive frames
-  max_frames: null  # null = use all frames, or set to limit (e.g., 500)
+  max_frames: null  # null = use all frames
+
+  # Data augmentation (following R2D2/SuperPoint best practices)
+  augmentation:
+    enabled: true
+    brightness: 0.2      # ±20% brightness
+    contrast: 0.2        # ±20% contrast
+    hue: 0.1            # ±10% hue shift
+    saturation: 0.2     # ±20% saturation
+    gaussian_blur: 0.3  # 30% chance of blur
 
 # Loss configuration
 loss:
   weights:
-    photo: 1.0       # Photometric consistency
-    repeat: 2.0      # Keypoint repeatability (important!)
-    desc: 1.5        # Descriptor consistency
-    uncert: 0.5      # Uncertainty calibration
-  
-  repeat_threshold: 3.0  # Max distance in pixels for repeatability
-  desc_margin: 0.2       # Margin for descriptor contrastive loss
+    photo: 0.5       # Photometric consistency
+    repeat: 0.3      # Keypoint repeatability
+    desc: 3.0        # Descriptor consistency (InfoNCE)
+    uncert: 0.2      # Uncertainty calibration
+    variance: 1.0    # Descriptor variance regularization (NEW - prevent collapse!)
+
+  repeat_threshold: 2.0  # Max distance in PATCH coordinates (28x28 grid)
+  desc_margin: 0.5       # Margin for contrastive loss
+  desc_temperature: 0.07 # Temperature for InfoNCE loss
+  desc_negatives: 20     # Number of negative samples
   uncert_type: "mse"     # 'mse' or 'l1'
 
 # Training configuration
 training:
   epochs: 50
-  batch_size: 4  # Adjust based on GPU memory (RTX 5070 should handle 4-8)
+  batch_size: 4
   lr: 1e-4
   lr_min: 1e-6
   weight_decay: 1e-4
   grad_clip: 1.0
   num_workers: 4
-  
-  val_interval: 2     # Validate every N epochs
+  warmup_epochs: 3  # Linear warmup for stability
+
+  val_interval: 1     # Validate EVERY epoch
   save_interval: 5    # Save checkpoint every N epochs
   save_dir: "checkpoints"
 
@@ -63,4 +72,5 @@ training:
 logging:
   use_wandb: true
   project: "semantic-slam-thesis"
-  run_name: "dinov2-heads-v1"
+  run_name: "dinov3-heads-fixed-v2"
+  log_interval: 50  # Log every N batches
