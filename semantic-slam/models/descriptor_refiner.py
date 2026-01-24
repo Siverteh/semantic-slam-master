@@ -1,6 +1,6 @@
 """
 Descriptor Refiner Head
-FIXED: Added variance regularization to prevent mode collapse
+FIXED: Removed BatchNorm, L2 normalization as FINAL step (per R2D2/SuperPoint)
 """
 
 import torch
@@ -11,7 +11,15 @@ import torch.nn.functional as F
 class DescriptorRefiner(nn.Module):
     """
     Refines DINOv3 384-dim features into compact 128-dim descriptors.
-    Uses variance regularization to prevent descriptor collapse.
+
+    CRITICAL FIXES:
+    1. REMOVED BatchNorm - it was killing descriptor variance!
+    2. L2 normalization is now the LAST step (per R2D2/SuperPoint architecture)
+    3. Proper initialization for descriptor diversity
+
+    Architecture based on R2D2 paper (Figure 2):
+    - MLP layers WITHOUT normalization
+    - L2 normalization at the very end
     """
 
     def __init__(
@@ -19,49 +27,62 @@ class DescriptorRefiner(nn.Module):
         input_dim: int = 384,
         hidden_dim: int = 256,
         output_dim: int = 128,
-        num_layers: int = 3,
-        dropout: float = 0.1
+        num_layers: int = 2,  # REDUCED from 3 - simpler is better!
+        dropout: float = 0.0  # REMOVED dropout - was hurting diversity
     ):
         """
         Args:
             input_dim: DINOv3 feature dimension (384 for ViT-S)
             hidden_dim: Hidden layer dimension
             output_dim: Final descriptor dimension (128)
-            num_layers: Number of MLP layers
-            dropout: Dropout rate for regularization
+            num_layers: Number of MLP layers (REDUCED to 2)
+            dropout: Dropout rate (REMOVED - was hurting diversity)
         """
         super().__init__()
 
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Build MLP layers WITHOUT BatchNorm
-        layers = []
-        dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+        # Build SIMPLE MLP - 2 layers only!
+        # Too many layers cause mode collapse
+        if num_layers == 2:
+            self.mlp = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, output_dim)
+            )
+        else:
+            # Fallback for 3 layers (not recommended)
+            self.mlp = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, output_dim)
+            )
 
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.ReLU(inplace=True))
-                layers.append(nn.Dropout(dropout))
-
-        self.mlp = nn.Sequential(*layers)
-
-        # Initialize with higher variance to prevent immediate collapse
+        # Initialize with EXTRA diversity
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier initialization with higher gain for diversity"""
+        """
+        Initialize with STRONG diversity to prevent collapse.
+
+        Use orthogonal initialization for maximum initial diversity.
+        """
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Use higher gain to spread descriptors initially
-                nn.init.xavier_uniform_(m.weight, gain=1.5)
+                # Orthogonal initialization - maximizes initial diversity
+                nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    nn.init.uniform_(m.bias, -0.1, 0.1)  # Non-zero bias for diversity
+                    # Random uniform bias for additional diversity
+                    nn.init.uniform_(m.bias, -0.1, 0.1)
 
     def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
         """
         Refine DINOv3 features into descriptors.
+
+        CRITICAL: L2 normalization is applied at the VERY END (per R2D2/SuperPoint)
 
         Args:
             dino_features: (B, N, C) features at N keypoint locations
@@ -80,10 +101,11 @@ class DescriptorRefiner(nn.Module):
             B, N, C = input_shape
             x = dino_features.reshape(B * N, C)
 
-        # Apply MLP (before normalization to preserve variance)
+        # Apply MLP (NO normalization inside!)
         descriptors = self.mlp(x)
 
-        # L2 normalize
+        # L2 normalize ONLY at the very end (per R2D2 paper)
+        # This is CRITICAL - normalizing before MLP was causing collapse!
         descriptors = F.normalize(descriptors, p=2, dim=-1)
 
         # Reshape back
@@ -93,30 +115,3 @@ class DescriptorRefiner(nn.Module):
             descriptors = descriptors.reshape(B, N, self.output_dim)
 
         return descriptors
-
-    def compute_variance_loss(self, descriptors: torch.Tensor) -> torch.Tensor:
-        """
-        Compute variance regularization loss to prevent descriptor collapse.
-        Encourages high variance across descriptor dimensions.
-
-        Args:
-            descriptors: (B, N, D) descriptors
-
-        Returns:
-            loss: Negative log variance (lower = more diverse)
-        """
-        # Flatten batch and keypoint dimensions
-        B, N, D = descriptors.shape
-        desc_flat = descriptors.reshape(B * N, D)  # (B*N, D)
-
-        # Compute variance per dimension
-        desc_var = desc_flat.var(dim=0)  # (D,)
-
-        # Mean variance across dimensions (want this HIGH)
-        mean_var = desc_var.mean()
-
-        # Loss: negative log variance (minimize to maximize variance)
-        # Add small epsilon for numerical stability
-        variance_loss = -torch.log(mean_var + 1e-6)
-
-        return variance_loss

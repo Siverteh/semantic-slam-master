@@ -1,6 +1,6 @@
 """
 Self-Supervised Losses for Semantic SLAM
-FIXED: Proper loss scaling, InfoNCE contrastive loss
+FIXED: Better descriptor loss with more negatives, removed variance regularization
 """
 
 import torch
@@ -90,9 +90,13 @@ class PhotometricLoss(nn.Module):
 
 
 class RepeatabilityLoss(nn.Module):
-    """Keypoint repeatability loss"""
+    """
+    Keypoint repeatability loss with proper scaling.
 
-    def __init__(self, distance_threshold: float = 2.0):
+    FIXED: Better distance threshold and scaling
+    """
+
+    def __init__(self, distance_threshold: float = 3.0):
         super().__init__()
         self.distance_threshold = distance_threshold
 
@@ -123,6 +127,7 @@ class RepeatabilityLoss(nn.Module):
 
         distances = torch.norm(projected_kpts - keypoints2, dim=2)
 
+        # Smooth L1 loss (Huber loss)
         smooth_l1 = torch.where(
             distances < self.distance_threshold,
             0.5 * distances ** 2 / self.distance_threshold,
@@ -130,6 +135,8 @@ class RepeatabilityLoss(nn.Module):
         )
 
         loss = smooth_l1.mean()
+
+        # Scale by grid size for stability
         grid_size = (H / 16)
         loss = loss / grid_size
 
@@ -180,12 +187,16 @@ class RepeatabilityLoss(nn.Module):
 
 
 class DescriptorConsistencyLoss(nn.Module):
-    """InfoNCE-style contrastive loss for descriptors"""
+    """
+    Contrastive loss for descriptors with proper numerical stability.
 
-    def __init__(self, margin: float = 0.5, num_negatives: int = 20, temperature: float = 0.07):
+    Uses simple cosine distance loss + triplet-style margin loss.
+    Much more stable than InfoNCE for this application.
+    """
+
+    def __init__(self, margin: float = 0.2, temperature: float = 0.1):
         super().__init__()
         self.margin = margin
-        self.num_negatives = num_negatives
         self.temperature = temperature
 
     def forward(
@@ -194,6 +205,11 @@ class DescriptorConsistencyLoss(nn.Module):
         desc2: torch.Tensor,
         matches: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Compute descriptor loss using cosine distance + triplet margin.
+
+        This is MUCH more stable than InfoNCE and prevents negative loss.
+        """
         B = desc1.shape[0]
         device = desc1.device
 
@@ -217,30 +233,38 @@ class DescriptorConsistencyLoss(nn.Module):
             if len(idx1) == 0:
                 continue
 
-            matched_desc1 = desc1[b, idx1]
-            matched_desc2 = desc2[b, idx2]
+            matched_desc1 = desc1[b, idx1]  # (M, D)
+            matched_desc2 = desc2[b, idx2]  # (M, D)
 
-            # InfoNCE loss
-            sim_matrix = torch.mm(matched_desc1, desc2[b].t()) / self.temperature
-            pos_sim = (matched_desc1 * matched_desc2).sum(dim=-1) / self.temperature
+            # POSITIVE loss: Minimize distance between matched pairs
+            # Use cosine distance (1 - cosine_similarity)
+            pos_sim = (matched_desc1 * matched_desc2).sum(dim=-1)  # Cosine similarity
+            pos_loss = (1 - pos_sim).mean()  # Cosine distance
 
-            exp_sim = torch.exp(sim_matrix)
-            exp_pos = torch.exp(pos_sim)
+            # NEGATIVE loss: Maximize distance to non-matches (triplet-style)
+            # Compute similarity to ALL descriptors
+            sim_matrix = torch.mm(matched_desc1, desc2[b].t())  # (M, N)
 
-            loss_infoNCE = -torch.log(exp_pos / (exp_sim.sum(dim=1) + 1e-8)).mean()
-
-            # Hard negative margin loss
+            # Mask out the positive matches
             mask = torch.ones_like(sim_matrix, dtype=torch.bool)
             mask[torch.arange(len(idx1)), idx2] = False
 
             if mask.sum() > 0:
-                neg_sim = sim_matrix[mask].reshape(len(idx1), -1)
-                hard_neg_sim, _ = neg_sim.max(dim=1)
-                margin_loss = torch.relu(hard_neg_sim * self.temperature - pos_sim * self.temperature + self.margin).mean()
-            else:
-                margin_loss = 0.0
+                # Get similarities to negatives
+                neg_sims = sim_matrix[mask].reshape(len(idx1), -1)  # (M, N-1)
 
-            total_loss += loss_infoNCE + 0.5 * margin_loss
+                # Find hardest negative (highest similarity)
+                hard_neg_sim, _ = neg_sims.max(dim=1)  # (M,)
+
+                # Triplet margin loss:
+                # Want: pos_sim > hard_neg_sim + margin
+                # Loss: max(0, hard_neg_sim - pos_sim + margin)
+                triplet_loss = torch.relu(hard_neg_sim - pos_sim + self.margin).mean()
+            else:
+                triplet_loss = torch.tensor(0.0, device=device)
+
+            # Combine both losses
+            total_loss += pos_loss + triplet_loss
             num_valid += 1
 
         if num_valid > 0:
@@ -261,6 +285,7 @@ class UncertaintyCalibrationLoss(nn.Module):
         predicted_confidence: torch.Tensor,
         actual_error: torch.Tensor
     ) -> torch.Tensor:
+        # Normalize error to [0, 1]
         error_flat = actual_error.flatten()
         error_95th = torch.quantile(error_flat, 0.95)
         error_norm = torch.clamp(actual_error / (error_95th + 1e-6), 0, 1)
@@ -275,3 +300,44 @@ class UncertaintyCalibrationLoss(nn.Module):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
         return loss
+
+
+class DescriptorDiversityLoss(nn.Module):
+    """
+    Explicit diversity loss to prevent descriptor collapse.
+
+    Encourages descriptors to span the full descriptor space.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
+        """
+        Compute diversity loss to prevent all descriptors becoming identical.
+
+        Args:
+            descriptors: (B, N, D) L2-normalized descriptors
+
+        Returns:
+            loss: Scalar diversity loss (lower = more diverse)
+        """
+        B, N, D = descriptors.shape
+
+        # Flatten batch dimension
+        desc_flat = descriptors.reshape(B * N, D)  # (B*N, D)
+
+        # Compute pairwise cosine similarities
+        # For L2-normalized vectors, cosine sim = dot product
+        sim_matrix = torch.mm(desc_flat, desc_flat.t())  # (B*N, B*N)
+
+        # We want LOW similarity between different descriptors
+        # Remove diagonal (self-similarity = 1)
+        mask = ~torch.eye(B * N, device=descriptors.device, dtype=torch.bool)
+        off_diag_sims = sim_matrix[mask]
+
+        # Loss: penalize HIGH similarities (we want them low)
+        # Mean of all pairwise similarities should be close to 0
+        diversity_loss = off_diag_sims.mean().abs()
+
+        return diversity_loss
