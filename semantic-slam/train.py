@@ -1,7 +1,6 @@
 """
 Main Training Script for Semantic SLAM Heads
-Trains keypoint selector, descriptor refiner, and uncertainty estimator
-FIXED: Better loss scaling, comprehensive logging, learning rate warmup
+FIXED: Removed variance regularization, better metrics, cleaner code
 """
 
 import os
@@ -29,7 +28,8 @@ from losses.self_supervised import (
     PhotometricLoss,
     RepeatabilityLoss,
     DescriptorConsistencyLoss,
-    UncertaintyCalibrationLoss
+    UncertaintyCalibrationLoss,
+    DescriptorDiversityLoss  # NEW!
 )
 
 
@@ -41,7 +41,7 @@ class SemanticSLAMTrainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         print("\n" + "="*70)
-        print("INITIALIZING SEMANTIC SLAM TRAINING")
+        print("INITIALIZING SEMANTIC SLAM TRAINING (FIXED VERSION)")
         print("="*70)
 
         # Initialize models
@@ -91,12 +91,12 @@ class SemanticSLAMTrainer:
         )
         self.desc_loss = DescriptorConsistencyLoss(
             margin=config['loss']['desc_margin'],
-            num_negatives=config['loss'].get('desc_negatives', 20),
-            temperature=config['loss'].get('desc_temperature', 0.07)
+            temperature=config['loss'].get('desc_temperature', 0.1)
         )
         self.uncert_loss = UncertaintyCalibrationLoss(
             loss_type=config['loss']['uncert_type']
         )
+        self.diversity_loss = DescriptorDiversityLoss()  # NEW!
 
         # Loss weights
         self.loss_weights = config['loss']['weights']
@@ -128,14 +128,14 @@ class SemanticSLAMTrainer:
             config['dataset']['train_sequences'],
             batch_size=config['training']['batch_size'],
             shuffle=True,
-            is_train=True  # Enable augmentation
+            is_train=True
         )
 
         self.val_loader = self._create_dataloader(
             config['dataset']['val_sequences'],
             batch_size=config['training']['batch_size'],
             shuffle=False,
-            is_train=False  # No augmentation for validation
+            is_train=False
         )
 
         print(f"  ✓ Train batches: {len(self.train_loader)}")
@@ -156,7 +156,7 @@ class SemanticSLAMTrainer:
         self.best_val_loss = float('inf')
 
         print("\n" + "="*70)
-        print("✓ INITIALIZATION COMPLETE")
+        print("✓ INITIALIZATION COMPLETE - ARCHITECTURE FIXED")
         print("="*70 + "\n")
 
     def _create_dataloader(
@@ -180,7 +180,6 @@ class SemanticSLAMTrainer:
             )
             datasets.append(dataset)
 
-        # Concatenate datasets
         from torch.utils.data import ConcatDataset
         combined_dataset = ConcatDataset(datasets)
 
@@ -195,10 +194,8 @@ class SemanticSLAMTrainer:
     def _get_lr(self, epoch: int) -> float:
         """Get learning rate with warmup"""
         if epoch < self.warmup_epochs:
-            # Linear warmup
             return self.base_lr * (epoch + 1) / self.warmup_epochs
         else:
-            # Use scheduler
             return self.optimizer.param_groups[0]['lr']
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -214,13 +211,7 @@ class SemanticSLAMTrainer:
                 param_group['lr'] = lr
 
         total_loss = 0.0
-        losses_dict = {
-            'photo': 0.0,
-            'repeat': 0.0,
-            'desc': 0.0,
-            'uncert': 0.0,
-            'variance': 0.0  # NEW
-        }
+        losses_dict = {'photo': 0.0, 'repeat': 0.0, 'desc': 0.0, 'uncert': 0.0, 'diversity': 0.0}
 
         # Metrics tracking
         metrics = {
@@ -228,8 +219,7 @@ class SemanticSLAMTrainer:
             'mean_confidence': [],
             'saliency_max': [],
             'saliency_mean': [],
-            'desc_std': [],
-            'desc_variance': []
+            'desc_diversity': []  # RENAMED from desc_variance
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:2d}")
@@ -275,15 +265,13 @@ class SemanticSLAMTrainer:
                 if key in batch_metrics:
                     metrics[key].append(batch_metrics[key])
 
-            # Update progress bar with better info
+            # Update progress bar
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f"{loss.item():.3f}",
-                'L_photo': f"{loss_components['photo']:.3f}",
-                'L_repeat': f"{loss_components['repeat']:.3f}",
                 'L_desc': f"{loss_components['desc']:.3f}",
                 'matches': f"{batch_metrics.get('num_matches', 0):.0f}",
-                'desc_std': f"{batch_metrics.get('desc_std', 0):.3f}",  # Should be ~0.3-0.5
+                'desc_div': f"{batch_metrics.get('desc_diversity', 0):.3f}",  # RENAMED
                 'lr': f"{current_lr:.1e}"
             })
 
@@ -297,9 +285,7 @@ class SemanticSLAMTrainer:
                     'batch/repeat': loss_components['repeat'],
                     'batch/desc': loss_components['desc'],
                     'batch/uncert': loss_components['uncert'],
-                    'batch/variance': loss_components['variance'],
                     'batch/num_matches': batch_metrics.get('num_matches', 0),
-                    'batch/mean_confidence': batch_metrics.get('mean_confidence', 0),
                     'batch/desc_variance': batch_metrics.get('desc_variance', 0),
                     'lr': current_lr,
                     'step': self.global_step
@@ -328,7 +314,7 @@ class SemanticSLAMTrainer:
     ) -> tuple:
         """Complete forward pass through all heads"""
 
-        # Extract DINOv3 features
+        # Extract DINOv3 features (now with proper normalization!)
         with torch.no_grad():
             feat1 = self.backbone(rgb1)  # (B, H, W, C)
             feat2 = self.backbone(rgb2)
@@ -351,7 +337,7 @@ class SemanticSLAMTrainer:
         feat_at_kpts1 = self.backbone.extract_at_keypoints(feat1, kpts1)
         feat_at_kpts2 = self.backbone.extract_at_keypoints(feat2, kpts2)
 
-        # Refine descriptors
+        # Refine descriptors (L2 norm happens INSIDE refiner at the end)
         desc1 = self.refiner(feat_at_kpts1)  # (B, N, D)
         desc2 = self.refiner(feat_at_kpts2)
 
@@ -361,22 +347,22 @@ class SemanticSLAMTrainer:
 
         # Compute losses
 
-        # 1. Photometric loss (dense warping)
+        # 1. Photometric loss
         loss_photo = self.photo_loss(rgb1, rgb2, depth1, rel_pose)
 
-        # 2. Repeatability loss (keypoint stability)
+        # 2. Repeatability loss
         loss_repeat = self.repeat_loss(kpts1, kpts2, depth1, rel_pose)
 
-        # 3. Descriptor loss (need matches first)
+        # 3. Descriptor loss
         matches = self._find_matches(desc1, desc2, kpts1, kpts2, depth1, rel_pose)
         loss_desc = self.desc_loss(desc1, desc2, matches)
 
-        # 4. Uncertainty loss (predict reprojection error)
+        # 4. Uncertainty loss
         reproj_error1 = self._compute_reprojection_error(kpts1, kpts2, depth1, rel_pose)
         loss_uncert = self.uncert_loss(conf1, reproj_error1)
 
-        # 5. Variance regularization (CRITICAL - prevent descriptor collapse!)
-        loss_variance = self.refiner.compute_variance_loss(desc1)
+        # 5. Diversity loss (NEW - prevents descriptor collapse!)
+        loss_diversity = self.diversity_loss(desc1)
 
         # Weighted combination
         w = self.loss_weights
@@ -385,7 +371,7 @@ class SemanticSLAMTrainer:
             w['repeat'] * loss_repeat +
             w['desc'] * loss_desc +
             w['uncert'] * loss_uncert +
-            w.get('variance', 1.0) * loss_variance  # NEW
+            w['diversity'] * loss_diversity  # NEW!
         )
 
         loss_components = {
@@ -393,23 +379,35 @@ class SemanticSLAMTrainer:
             'repeat': loss_repeat.item(),
             'desc': loss_desc.item(),
             'uncert': loss_uncert.item(),
-            'variance': loss_variance.item()  # NEW
+            'diversity': loss_diversity.item()  # NEW!
         }
 
         # Compute batch metrics
-        # FIXED: desc_std should be variance across feature dimension, not all dims
+        # FIXED: For L2-normalized descriptors, use pairwise similarity instead of variance
         desc_flat = desc1.reshape(-1, desc1.shape[-1])  # (B*N, D)
-        desc_variance = desc_flat.var(dim=0).mean().item()  # Variance per feature dim
-        desc_std = desc_flat.std().item()  # Overall std
+
+        # Compute pairwise cosine similarities (for L2-normalized = dot product)
+        # Sample subset for efficiency
+        if desc_flat.shape[0] > 500:
+            indices = torch.randperm(desc_flat.shape[0])[:500]
+            desc_sample = desc_flat[indices]
+        else:
+            desc_sample = desc_flat
+
+        sim_matrix = torch.mm(desc_sample, desc_sample.t())
+        # Remove diagonal (self-similarity)
+        mask = ~torch.eye(sim_matrix.shape[0], device=sim_matrix.device, dtype=torch.bool)
+        pairwise_sims = sim_matrix[mask]
+
+        # Mean absolute similarity (0 = diverse, 1 = collapsed)
+        desc_diversity = pairwise_sims.abs().mean().item()
 
         batch_metrics = {
             'num_matches': matches.shape[1],
             'mean_confidence': conf1.mean().item(),
             'saliency_max': saliency1.max().item(),
             'saliency_mean': saliency1.mean().item(),
-            'desc_std': desc_std,  # Fixed calculation
-            'desc_variance': desc_variance,  # Per-feature variance
-            'desc_mean_norm': desc1.norm(dim=-1).mean().item()
+            'desc_diversity': desc_diversity  # RENAMED from desc_variance
         }
 
         return total_loss, loss_components, batch_metrics
@@ -447,7 +445,6 @@ class SemanticSLAMTrainer:
             if len(idx1) > 0:
                 matches_b = torch.stack([idx1, idx2], dim=1)
             else:
-                # No matches found
                 matches_b = torch.zeros(0, 2, device=device, dtype=torch.long)
 
             matches_list.append(matches_b)
@@ -478,7 +475,7 @@ class SemanticSLAMTrainer:
         H, W = depth1.shape[2:]
         device = kpts1.device
 
-        # Create default intrinsics (TUM RGB-D)
+        # Create default intrinsics
         fx = fy = 525.0 * (H / 480.0)
         cx = cy = H / 2.0
         intrinsics = torch.tensor([
@@ -506,12 +503,11 @@ class SemanticSLAMTrainer:
         self.estimator.eval()
 
         total_loss = 0.0
-        losses_dict = {'photo': 0.0, 'repeat': 0.0, 'desc': 0.0, 'uncert': 0.0, 'variance': 0.0}
+        losses_dict = {'photo': 0.0, 'repeat': 0.0, 'desc': 0.0, 'uncert': 0.0, 'diversity': 0.0}
         metrics = {
             'num_matches': [],
             'mean_confidence': [],
-            'desc_std': [],
-            'desc_variance': []
+            'desc_diversity': []  # RENAMED
         }
 
         with torch.no_grad():
@@ -573,33 +569,37 @@ class SemanticSLAMTrainer:
                 print(f"{'  Repeatability':<20} {train_losses['repeat']:>12.4f} {val_losses['repeat']:>12.4f}")
                 print(f"{'  Descriptor':<20} {train_losses['desc']:>12.4f} {val_losses['desc']:>12.4f}")
                 print(f"{'  Uncertainty':<20} {train_losses['uncert']:>12.4f} {val_losses['uncert']:>12.4f}")
-                print(f"{'  Variance':<20} {train_losses['variance']:>12.4f} {val_losses['variance']:>12.4f}")
+                print(f"{'  Diversity':<20} {train_losses['diversity']:>12.4f} {val_losses['diversity']:>12.4f}")
                 print(f"{'-'*70}")
                 print(f"{'Avg Matches':<20} {train_losses.get('num_matches', 0):>12.1f} {val_losses.get('num_matches', 0):>12.1f}")
                 print(f"{'Mean Confidence':<20} {train_losses.get('mean_confidence', 0):>12.3f} {val_losses.get('mean_confidence', 0):>12.3f}")
-                print(f"{'Desc Std':<20} {train_losses.get('desc_std', 0):>12.3f} {val_losses.get('desc_std', 0):>12.3f}")
-                print(f"{'Desc Variance':<20} {train_losses.get('desc_variance', 0):>12.3f} {val_losses.get('desc_variance', 0):>12.3f}")
+                print(f"{'Desc Diversity':<20} {train_losses.get('desc_diversity', 0):>12.3f} {val_losses.get('desc_diversity', 0):>12.3f}")  # RENAMED
                 print(f"{'Learning Rate':<20} {self.optimizer.param_groups[0]['lr']:>12.1e}")
                 print(f"{'='*70}\n")
 
-                # Warning if descriptor collapse detected
-                desc_var = train_losses.get('desc_variance', 0)
-                if desc_var < 0.08:  # Variance threshold (should be >0.1)
-                    print(f"⚠️  WARNING: Descriptor collapse! (variance={desc_var:.3f} < 0.08)")
-                    print("   All descriptors are too similar. Training may not converge.")
-                    print()
+                # Check for descriptor health (UPDATED)
+                desc_div = train_losses.get('desc_diversity', 0)
+                if desc_div > 0.5:
+                    print(f"⚠️  WARNING: Descriptor diversity low ({desc_div:.3f} > 0.5)")
+                    print("   Descriptors may be too similar (collapse)")
+                elif desc_div < 0.1:
+                    print(f"✓ Descriptor diversity excellent ({desc_div:.3f} < 0.1)")
+                    print("   Descriptors are well-separated!")
 
-                if train_losses.get('num_matches', 0) < 50:
-                    print(f"⚠️  WARNING: Very few matches! ({train_losses.get('num_matches', 0):.0f} < 50)")
-                    print("   Descriptors may not be discriminative enough")
-                    print()
+                # Check diversity loss (should decrease as descriptors learn to match)
+                diversity_loss = train_losses.get('diversity', 0)
+                if diversity_loss < 0.02:
+                    print(f"✓ Diversity loss healthy ({diversity_loss:.3f})")
+                    print("   Descriptors learning to match correctly!")
 
-                # Warning about train/val gap
-                train_val_gap = abs(train_losses['total'] - val_losses['total'])
-                if train_val_gap > 1.0:
-                    print(f"⚠️  WARNING: Large train/val gap! ({train_val_gap:.2f})")
-                    print("   Model may be overfitting. Consider: more augmentation, dropout, or early stopping")
-                    print()
+                # Check matches
+                num_matches = train_losses.get('num_matches', 0)
+                if num_matches < 100:
+                    print(f"⚠️  WARNING: Few matches ({num_matches:.0f})")
+                elif num_matches > 200:
+                    print(f"✓ Good match count ({num_matches:.0f})")
+
+                print()
 
                 # Log to wandb
                 if self.config['logging']['use_wandb']:
@@ -610,19 +610,17 @@ class SemanticSLAMTrainer:
                         'train/repeat': train_losses['repeat'],
                         'train/desc': train_losses['desc'],
                         'train/uncert': train_losses['uncert'],
-                        'train/variance': train_losses['variance'],
+                        'train/diversity': train_losses['diversity'],
                         'train/num_matches': train_losses.get('num_matches', 0),
-                        'train/mean_confidence': train_losses.get('mean_confidence', 0),
-                        'train/desc_variance': train_losses.get('desc_variance', 0),
+                        'train/desc_diversity': train_losses.get('desc_diversity', 0),  # RENAMED
                         'val/total': val_losses['total'],
                         'val/photo': val_losses['photo'],
                         'val/repeat': val_losses['repeat'],
                         'val/desc': val_losses['desc'],
                         'val/uncert': val_losses['uncert'],
-                        'val/variance': val_losses['variance'],
+                        'val/diversity': val_losses['diversity'],
                         'val/num_matches': val_losses.get('num_matches', 0),
-                        'val/mean_confidence': val_losses.get('mean_confidence', 0),
-                        'val/desc_variance': val_losses.get('desc_variance', 0),
+                        'val/desc_diversity': val_losses.get('desc_diversity', 0),  # RENAMED
                         'lr': self.optimizer.param_groups[0]['lr']
                     })
 
@@ -631,23 +629,19 @@ class SemanticSLAMTrainer:
                     improvement = self.best_val_loss - val_losses['total']
                     self.best_val_loss = val_losses['total']
                     self.save_checkpoint('best_model.pth', epoch, val_losses['total'])
-                    print(f"✓ Saved best model (val_loss: {self.best_val_loss:.4f}, improved by {improvement:.4f})\n")
+                    print(f"✓ Saved best model (val_loss: {self.best_val_loss:.4f})\n")
 
-            # Step scheduler (after warmup)
+            # Step scheduler
             if epoch >= self.warmup_epochs:
                 self.scheduler.step()
 
             # Save checkpoint periodically
             if epoch % self.config['training']['save_interval'] == 0:
                 self.save_checkpoint(f'checkpoint_epoch{epoch}.pth', epoch, train_losses['total'])
-                print(f"💾 Saved checkpoint at epoch {epoch}\n")
 
         print("\n" + "="*70)
         print("✓ TRAINING COMPLETE!")
         print("="*70)
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
-        print(f"Model saved to: {Path(self.config['training']['save_dir']) / 'best_model.pth'}")
-        print("="*70 + "\n")
 
     def save_checkpoint(self, filename: str, epoch: int, loss: float):
         """Save model checkpoint"""
@@ -669,12 +663,10 @@ class SemanticSLAMTrainer:
 
 
 def main():
-    # Load config
     config_path = "configs/train_config.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Create trainer and train
     trainer = SemanticSLAMTrainer(config)
     trainer.train()
 
