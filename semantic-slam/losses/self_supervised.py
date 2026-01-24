@@ -1,6 +1,6 @@
 """
 Self-Supervised Losses for Semantic SLAM
-FIXED: Better descriptor loss with more negatives, removed variance regularization
+COMPLETE VERSION - All losses including selector training
 """
 
 import torch
@@ -90,11 +90,7 @@ class PhotometricLoss(nn.Module):
 
 
 class RepeatabilityLoss(nn.Module):
-    """
-    Keypoint repeatability loss with proper scaling.
-
-    FIXED: Better distance threshold and scaling
-    """
+    """Keypoint repeatability loss with proper scaling"""
 
     def __init__(self, distance_threshold: float = 3.0):
         super().__init__()
@@ -127,7 +123,6 @@ class RepeatabilityLoss(nn.Module):
 
         distances = torch.norm(projected_kpts - keypoints2, dim=2)
 
-        # Smooth L1 loss (Huber loss)
         smooth_l1 = torch.where(
             distances < self.distance_threshold,
             0.5 * distances ** 2 / self.distance_threshold,
@@ -135,8 +130,6 @@ class RepeatabilityLoss(nn.Module):
         )
 
         loss = smooth_l1.mean()
-
-        # Scale by grid size for stability
         grid_size = (H / 16)
         loss = loss / grid_size
 
@@ -188,16 +181,19 @@ class RepeatabilityLoss(nn.Module):
 
 class DescriptorConsistencyLoss(nn.Module):
     """
-    Contrastive loss for descriptors with proper numerical stability.
-
-    Uses simple cosine distance loss + triplet-style margin loss.
-    Much more stable than InfoNCE for this application.
+    InfoNCE contrastive loss for descriptors with hard negative mining.
     """
 
-    def __init__(self, margin: float = 0.2, temperature: float = 0.1):
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        num_negatives: int = 50,
+        margin: float = 0.2
+    ):
         super().__init__()
-        self.margin = margin
         self.temperature = temperature
+        self.num_negatives = num_negatives
+        self.margin = margin
 
     def forward(
         self,
@@ -205,11 +201,6 @@ class DescriptorConsistencyLoss(nn.Module):
         desc2: torch.Tensor,
         matches: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute descriptor loss using cosine distance + triplet margin.
-
-        This is MUCH more stable than InfoNCE and prevents negative loss.
-        """
         B = desc1.shape[0]
         device = desc1.device
 
@@ -233,38 +224,40 @@ class DescriptorConsistencyLoss(nn.Module):
             if len(idx1) == 0:
                 continue
 
-            matched_desc1 = desc1[b, idx1]  # (M, D)
-            matched_desc2 = desc2[b, idx2]  # (M, D)
+            matched_desc1 = desc1[b, idx1]
+            matched_desc2 = desc2[b, idx2]
 
-            # POSITIVE loss: Minimize distance between matched pairs
-            # Use cosine distance (1 - cosine_similarity)
-            pos_sim = (matched_desc1 * matched_desc2).sum(dim=-1)  # Cosine similarity
-            pos_loss = (1 - pos_sim).mean()  # Cosine distance
+            # InfoNCE Loss
+            logits = torch.mm(matched_desc1, desc2[b].t()) / self.temperature
+            target_positions = idx2
+            infonce_loss = F.cross_entropy(logits, target_positions)
 
-            # NEGATIVE loss: Maximize distance to non-matches (triplet-style)
-            # Compute similarity to ALL descriptors
-            sim_matrix = torch.mm(matched_desc1, desc2[b].t())  # (M, N)
+            # Hard negative mining
+            sim_matrix = torch.mm(matched_desc1, desc2[b].t())
+            neg_mask = torch.ones_like(sim_matrix, dtype=torch.bool)
+            neg_mask[torch.arange(len(idx1)), idx2] = False
 
-            # Mask out the positive matches
-            mask = torch.ones_like(sim_matrix, dtype=torch.bool)
-            mask[torch.arange(len(idx1)), idx2] = False
+            if neg_mask.sum() > 0:
+                num_negs = min(self.num_negatives, neg_mask.sum() // len(idx1))
 
-            if mask.sum() > 0:
-                # Get similarities to negatives
-                neg_sims = sim_matrix[mask].reshape(len(idx1), -1)  # (M, N-1)
+                if num_negs > 0:
+                    neg_sims = sim_matrix.clone()
+                    neg_sims[~neg_mask] = -float('inf')
 
-                # Find hardest negative (highest similarity)
-                hard_neg_sim, _ = neg_sims.max(dim=1)  # (M,)
+                    hard_neg_sims, _ = torch.topk(neg_sims, k=num_negs, dim=1)
+                    pos_sims = (matched_desc1 * matched_desc2).sum(dim=-1)
 
-                # Triplet margin loss:
-                # Want: pos_sim > hard_neg_sim + margin
-                # Loss: max(0, hard_neg_sim - pos_sim + margin)
-                triplet_loss = torch.relu(hard_neg_sim - pos_sim + self.margin).mean()
+                    triplet_losses = torch.relu(
+                        hard_neg_sims - pos_sims.unsqueeze(1) + self.margin
+                    )
+
+                    triplet_loss = triplet_losses.mean()
+                else:
+                    triplet_loss = torch.tensor(0.0, device=device)
             else:
                 triplet_loss = torch.tensor(0.0, device=device)
 
-            # Combine both losses
-            total_loss += pos_loss + triplet_loss
+            total_loss += infonce_loss + 0.5 * triplet_loss
             num_valid += 1
 
         if num_valid > 0:
@@ -285,7 +278,6 @@ class UncertaintyCalibrationLoss(nn.Module):
         predicted_confidence: torch.Tensor,
         actual_error: torch.Tensor
     ) -> torch.Tensor:
-        # Normalize error to [0, 1]
         error_flat = actual_error.flatten()
         error_95th = torch.quantile(error_flat, 0.95)
         error_norm = torch.clamp(actual_error / (error_95th + 1e-6), 0, 1)
@@ -303,41 +295,130 @@ class UncertaintyCalibrationLoss(nn.Module):
 
 
 class DescriptorDiversityLoss(nn.Module):
-    """
-    Explicit diversity loss to prevent descriptor collapse.
+    """Diversity loss to prevent descriptor collapse"""
 
-    Encourages descriptors to span the full descriptor space.
-    """
-
-    def __init__(self):
+    def __init__(self, target_similarity: float = 0.1):
         super().__init__()
+        self.target_similarity = target_similarity
 
     def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
-        """
-        Compute diversity loss to prevent all descriptors becoming identical.
-
-        Args:
-            descriptors: (B, N, D) L2-normalized descriptors
-
-        Returns:
-            loss: Scalar diversity loss (lower = more diverse)
-        """
         B, N, D = descriptors.shape
+        device = descriptors.device
 
-        # Flatten batch dimension
-        desc_flat = descriptors.reshape(B * N, D)  # (B*N, D)
+        total_loss = 0.0
 
-        # Compute pairwise cosine similarities
-        # For L2-normalized vectors, cosine sim = dot product
-        sim_matrix = torch.mm(desc_flat, desc_flat.t())  # (B*N, B*N)
+        for b in range(B):
+            desc_b = descriptors[b]
+            sim_matrix = torch.mm(desc_b, desc_b.t())
 
-        # We want LOW similarity between different descriptors
-        # Remove diagonal (self-similarity = 1)
-        mask = ~torch.eye(B * N, device=descriptors.device, dtype=torch.bool)
-        off_diag_sims = sim_matrix[mask]
+            mask = ~torch.eye(N, device=device, dtype=torch.bool)
+            off_diag_sims = sim_matrix[mask]
 
-        # Loss: penalize HIGH similarities (we want them low)
-        # Mean of all pairwise similarities should be close to 0
-        diversity_loss = off_diag_sims.mean().abs()
+            squared_loss = ((off_diag_sims - self.target_similarity) ** 2).mean()
 
-        return diversity_loss
+            high_sim_mask = off_diag_sims > 0.3
+            if high_sim_mask.sum() > 0:
+                repulsion_loss = off_diag_sims[high_sim_mask].mean()
+            else:
+                repulsion_loss = 0.0
+
+            total_loss += squared_loss + 0.5 * repulsion_loss
+
+        return total_loss / B
+
+
+class PeakinessLoss(nn.Module):
+    """
+    NEW: Encourages saliency map to be PEAKED, not messy.
+
+    FIXED: Adjusted for sigmoid (allows multiple peaks).
+    Now just encourages clear peaks without forcing extreme sparsity.
+    """
+
+    def __init__(self, target_sparsity: float = 0.2):
+        """
+        Args:
+            target_sparsity: Target fraction of active locations (20% instead of 10%)
+        """
+        super().__init__()
+        self.target_sparsity = target_sparsity
+
+    def forward(self, saliency_map: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = saliency_map.shape
+        device = saliency_map.device
+
+        saliency_flat = saliency_map.squeeze(-1).reshape(B, H * W)
+
+        # COMPONENT 1: Contrast Loss
+        # Encourage high values to be HIGH and low values to be LOW
+        # This creates clear peaks without forcing single-point behavior
+        mean_val = saliency_flat.mean(dim=1, keepdim=True)
+        above_mean = saliency_flat > mean_val
+        below_mean = ~above_mean
+
+        if above_mean.sum() > 0:
+            high_vals = saliency_flat[above_mean]
+            # Want high values close to 1.0
+            high_loss = (1.0 - high_vals).mean()
+        else:
+            high_loss = torch.tensor(0.0, device=device)
+
+        if below_mean.sum() > 0:
+            low_vals = saliency_flat[below_mean]
+            # Want low values close to 0.0
+            low_loss = low_vals.mean()
+        else:
+            low_loss = torch.tensor(0.0, device=device)
+
+        contrast_loss = high_loss + low_loss
+
+        # COMPONENT 2: Soft Sparsity
+        # Gentle encouragement toward target sparsity (not strict)
+        l1_norm = saliency_flat.mean(dim=1)
+        target_l1 = self.target_sparsity
+        sparsity_loss = 0.5 * F.mse_loss(l1_norm, torch.full_like(l1_norm, target_l1))
+
+        total_loss = contrast_loss + sparsity_loss
+
+        return total_loss
+
+
+class FeatureVarianceLoss(nn.Module):
+    """
+    NEW: Selector should choose regions with HIGH DINOv3 variance.
+
+    High-variance regions (edges, corners, textures) are good for tracking.
+    """
+
+    def __init__(self, neighborhood_size: int = 3):
+        super().__init__()
+        self.neighborhood_size = neighborhood_size
+
+    def forward(
+        self,
+        saliency_map: torch.Tensor,
+        dino_features: torch.Tensor
+    ) -> torch.Tensor:
+        B, H, W, C = dino_features.shape
+        device = dino_features.device
+
+        # Compute local feature variance
+        features = dino_features.permute(0, 3, 1, 2)
+
+        kernel_size = self.neighborhood_size
+        avg_pool = F.avg_pool2d(features, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+
+        squared_diff = (features - avg_pool) ** 2
+        local_variance = F.avg_pool2d(squared_diff, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+
+        variance_map = local_variance.mean(dim=1, keepdim=True)
+
+        # Normalize to [0, 1]
+        variance_map = (variance_map - variance_map.min()) / (variance_map.max() - variance_map.min() + 1e-8)
+
+        variance_map = variance_map.permute(0, 2, 3, 1)
+
+        # Saliency should match variance
+        loss = F.mse_loss(saliency_map, variance_map)
+
+        return loss
