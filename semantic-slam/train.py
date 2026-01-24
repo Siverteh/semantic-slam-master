@@ -93,15 +93,15 @@ class SemanticSLAMTrainer:
             list(self.selector.parameters()) +
             list(self.refiner.parameters()) +
             list(self.estimator.parameters()),
-            lr=config['training']['lr'],
-            weight_decay=config['training']['weight_decay']
+            lr=float(config['training']['lr']),
+            weight_decay=float(config['training']['weight_decay'])
         )
         
         # Scheduler
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max=config['training']['epochs'],
-            eta_min=config['training']['lr_min']
+            eta_min=float(config['training']['lr_min'])
         )
         
         # Dataset

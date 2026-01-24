@@ -202,13 +202,22 @@ class RepeatabilityLoss(nn.Module):
         keypoints: torch.Tensor,
         depth: torch.Tensor,
         pose: torch.Tensor,
-        intrinsics: torch.Tensor,
+        intrinsics: Optional[torch.Tensor],
         H: int,
         W: int
     ) -> torch.Tensor:
         """Project keypoints from frame 1 to frame 2"""
         B, N, _ = keypoints.shape
         device = keypoints.device
+        
+        if intrinsics is None:
+            fx = fy = 525.0 * (H / 480.0)
+            cx = cy = H / 2.0
+            intrinsics = torch.tensor([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ], device=device).unsqueeze(0).repeat(B, 1, 1)
         
         # Sample depth at keypoint locations
         # Normalize keypoint coords to [-1, 1] for grid_sample
