@@ -40,20 +40,33 @@ class TUMDataset(Dataset):
             augmentation: Dict with augmentation params (only applied if is_train=True)
             is_train: Whether this is training (apply augmentation) or validation
         """
-        self.dataset_root = Path(dataset_root)
+        dataset_root_path = Path(dataset_root)
+        if not dataset_root_path.is_absolute():
+            project_root = Path(__file__).resolve().parents[1]
+            dataset_root_path = (project_root / dataset_root_path).resolve()
+
+        self.dataset_root = dataset_root_path
         self.sequence = sequence
         self.input_size = input_size
         self.frame_spacing = frame_spacing
         self.is_train = is_train
 
         # Paths
-        self.sequence_dir = self.dataset_root / sequence
+        candidate_sequence_dir = self.dataset_root / sequence
+        if candidate_sequence_dir.exists():
+            self.sequence_dir = candidate_sequence_dir
+        else:
+            # Allow dataset_root to point directly to a sequence directory
+            self.sequence_dir = self.dataset_root
         self.rgb_dir = self.sequence_dir / "rgb"
         self.depth_dir = self.sequence_dir / "depth"
         self.gt_file = self.sequence_dir / "groundtruth.txt"
 
         # Verify paths
-        assert self.sequence_dir.exists(), f"Sequence not found: {self.sequence_dir}"
+        assert self.sequence_dir.exists(), (
+            "Sequence not found. Checked: "
+            f"{candidate_sequence_dir} and {self.dataset_root}"
+        )
         assert self.rgb_dir.exists(), f"RGB directory not found: {self.rgb_dir}"
         assert self.depth_dir.exists(), f"Depth directory not found: {self.depth_dir}"
 
