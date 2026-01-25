@@ -1,76 +1,121 @@
-# Training Configuration for Semantic SLAM Heads
+# Training Configuration with Proper Train/Val/Test Split
+# NO OVERLAP between train/val/test!
 
 # Model architecture
 model:
-  backbone: "vit_small_patch16_dinov3.lvd1689m"  # DINOv3-ViT-S (384-dim, 22M params)
-  input_size: 448  # Image resolution (448 -> 28x28 patches)
-  num_keypoints: 500  # Number of keypoints to select
+  backbone: "vit_small_patch16_dinov3.lvd1689m"
+  input_size: 448
+  num_keypoints: 500
 
-  # Keypoint Selector Head
   selector_hidden: 256
   selector_layers: 3
 
-  # Descriptor Refiner Head
-  descriptor_dim: 128  # Output descriptor dimension
-  refiner_hidden: 256
-  refiner_layers: 3
+  descriptor_dim: 128
+  refiner_hidden: 384  # Increased capacity
+  refiner_layers: 4
 
-  # Uncertainty Estimator Head
   estimator_hidden: 128
 
-# Dataset configuration
+# Dataset configuration - PROPER SPLIT!
 dataset:
   root: "data/tum_rgbd"
-  train_sequences:
-    - "rgbd_dataset_freiburg1_desk"     # Static office baseline
-    - "rgbd_dataset_freiburg1_room"     # More complex scene
-  val_sequences:
-    - "rgbd_dataset_freiburg1_plant"    # Low texture validation
-  frame_spacing: 1  # Spacing between consecutive frames
-  max_frames: null  # null = use all frames
 
-  # Data augmentation (following R2D2/SuperPoint best practices)
+  # TRAINING: 3 sequences (mix of easy/medium, static)
+  train_sequences:
+    - "rgbd_dataset_freiburg1_desk"   # Easy: Static office, lots of texture
+    - "rgbd_dataset_freiburg1_room"   # Medium: Room with varied textures
+    - "rgbd_dataset_freiburg3_walking_static"  # Challenge: Dynamic person (fr3 sensor)
+
+  # VALIDATION: 1 sequence (main challenge case)
+  val_sequences:
+    - "rgbd_dataset_freiburg1_plant"  # Hard: Low texture (classic SLAM challenge)
+
+  # TEST (for final evaluation only): 2 sequences - NEVER SEEN DURING TRAINING!
+  # Note: These should ONLY be used in test scripts, not during training
+  test_sequences:
+    - "rgbd_dataset_freiburg3_long_office_household"  # Long sequence, drift test
+    - "rgbd_dataset_freiburg3_walking_xyz"  # Dynamic + structured motion
+
+  frame_spacing: 1
+  max_frames: null
+
+  # Data augmentation
   augmentation:
     enabled: true
-    brightness: 0.2      # ±20% brightness
-    contrast: 0.2        # ±20% contrast
-    hue: 0.1            # ±10% hue shift
-    saturation: 0.2     # ±20% saturation
-    gaussian_blur: 0.3  # 30% chance of blur
+    brightness: 0.2
+    contrast: 0.2
+    hue: 0.1
+    saturation: 0.2
+    gaussian_blur: 0.3
 
-# Loss configuration
+# Loss configuration - CORRECT APPROACH!
 loss:
   weights:
-    photo: 0.5       # Photometric consistency
-    repeat: 0.3      # Keypoint repeatability
-    desc: 3.0        # Descriptor consistency (InfoNCE)
-    uncert: 0.2      # Uncertainty calibration
-    variance: 1.0    # Descriptor variance regularization (NEW - prevent collapse!)
+    desc: 8.0        # Strong descriptor learning (dominant)
+    repeat: 0.3
+    variance: 0.5    # Prevent collapse
+    peakiness: 0.1
+    activation: 0.05
+    edge: 0.3        # REDUCED from 0.8! (was too dominant)
+    sparsity: 0.3
 
-  repeat_threshold: 2.0  # Max distance in PATCH coordinates (28x28 grid)
-  desc_margin: 0.5       # Margin for contrastive loss
-  desc_temperature: 0.07 # Temperature for InfoNCE loss
-  desc_negatives: 20     # Number of negative samples
-  uncert_type: "mse"     # 'mse' or 'l1'
+  # Descriptor loss (InfoNCE)
+  desc_temperature: 0.10  # Slightly higher for stability
+  desc_negatives: 40
+
+  # Repeatability loss
+  repeat_threshold: 2.0
+
+  # Peakiness loss
+  target_variance: 0.22
+
+  # Activation loss
+  sparsity_target: 0.35
+
+  # Edge awareness loss
+  edge_threshold: 0.1
+
+  # Spatial sparsity loss
+  sparsity_penalty: 2.0
 
 # Training configuration
 training:
-  epochs: 50
+  epochs: 60
   batch_size: 4
   lr: 1e-4
   lr_min: 1e-6
   weight_decay: 1e-4
   grad_clip: 1.0
   num_workers: 4
-  warmup_epochs: 3  # Linear warmup for stability
+  warmup_epochs: 3
 
-  val_interval: 1     # Validate EVERY epoch
-  save_interval: 5    # Save checkpoint every N epochs
+  val_interval: 1
+  save_interval: 5
   save_dir: "checkpoints"
 
 # Logging configuration
 logging:
   use_wandb: true
   project: "semantic-slam-thesis"
-  run_name: "dinov3-heads-fixed-v2"
-  log_interval: 50  # Log every N batches
+  run_name: "proper-split-fixed-edge-v1"
+  log_interval: 50
+
+# Dataset rationale (for your thesis documentation):
+#
+# TRAINING (3 sequences):
+#   - fr1_desk: Baseline static scene with good texture
+#   - fr1_room: More complex indoor environment
+#   - fr3_walking_static: Introduces dynamic objects + fr3 sensor diversity
+#
+# VALIDATION (1 sequence):
+#   - fr1_plant: Low-texture challenge (standard SLAM benchmark)
+#
+# TEST (2 sequences - use ONLY for final evaluation):
+#   - fr3_long_office_household: Tests long-term stability and drift
+#   - fr3_walking_xyz: Tests dynamic scene handling
+#
+# This split ensures:
+#   1. No train/test overlap (prevents overfitting)
+#   2. Sensor diversity (fr1 Kinect v1 + fr3 Kinect v2)
+#   3. Challenge diversity (static, low-texture, dynamic, long-term)
+#   4. Standard benchmarks (fr1_plant, fr1_desk are widely used)

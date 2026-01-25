@@ -96,8 +96,7 @@ class MatchVisualizer:
             'image': image,
             'keypoints_pixel': keypoints_pixel[0].cpu().numpy(),
             'scores': scores[0].cpu().numpy(),
-            'descriptors': descriptors[0].cpu().numpy(),
-            'saliency_map': saliency_map[0, :, :, 0].cpu().numpy()
+            'descriptors': descriptors[0].cpu().numpy()
         }
 
     def find_matches(self, desc1: np.ndarray, desc2: np.ndarray, ratio_thresh: float = 0.8):
@@ -184,70 +183,16 @@ class MatchVisualizer:
 
         canvas_rgb = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
 
-        # Create plot
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-
-        # 1. Matches
-        axes[0, 0].imshow(canvas_rgb)
-        axes[0, 0].set_title(f'Matches (Top {len(matches)} of {len(feat1["descriptors"])} kpts)\n'
-                            f'Green = High Similarity, Red = Low Similarity',
-                            fontsize=12, fontweight='bold')
-        axes[0, 0].axis('off')
-
-        # 2. Saliency map 1
-        im1 = axes[0, 1].imshow(feat1['saliency_map'], cmap='hot')
-        axes[0, 1].set_title(f'Frame 1 Saliency Map\n'
-                            f'Mean: {feat1["saliency_map"].mean():.3f}, '
-                            f'Max: {feat1["saliency_map"].max():.3f}',
-                            fontsize=12, fontweight='bold')
-        axes[0, 1].axis('off')
-        plt.colorbar(im1, ax=axes[0, 1])
-
-        # 3. Saliency map 2
-        im2 = axes[1, 0].imshow(feat2['saliency_map'], cmap='hot')
-        axes[1, 0].set_title(f'Frame 2 Saliency Map\n'
-                            f'Mean: {feat2["saliency_map"].mean():.3f}, '
-                            f'Max: {feat2["saliency_map"].max():.3f}',
-                            fontsize=12, fontweight='bold')
-        axes[1, 0].axis('off')
-        plt.colorbar(im2, ax=axes[1, 0])
-
-        # 4. Statistics
-        axes[1, 1].axis('off')
-
-        if matches:
-            sims = [m[2] for m in matches]
-            stats_text = f"""
-MATCH STATISTICS:
-
-Total keypoints: {len(feat1['descriptors'])}
-Mutual NN matches: {len(matches)}
-Match rate: {len(matches)/len(feat1['descriptors'])*100:.1f}%
-
-Similarity scores:
-  Mean: {np.mean(sims):.3f}
-  Median: {np.median(sims):.3f}
-  Min: {np.min(sims):.3f}
-  Max: {np.max(sims):.3f}
-
-Frame 1 saliency:
-  Mean: {feat1['saliency_map'].mean():.3f}
-  Max: {feat1['saliency_map'].max():.3f}
-  Variance: {feat1['saliency_map'].var():.4f}
-
-Frame 2 saliency:
-  Mean: {feat2['saliency_map'].mean():.3f}
-  Max: {feat2['saliency_map'].max():.3f}
-  Variance: {feat2['saliency_map'].var():.4f}
-
-Higher variance = better contrast
-Good variance: 0.10-0.20
-            """
-        else:
-            stats_text = "\nNo matches found!\n\nPossible reasons:\n- Too much motion\n- Different scenes\n- Training not converged"
-
-        axes[1, 1].text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
-                       verticalalignment='center')
+        # Create plot (matches only)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.imshow(canvas_rgb)
+        ax.set_title(
+            f'Matches (Top {len(matches)} of {len(feat1["descriptors"])} kpts)\n'
+            f'Green = High Similarity, Red = Low Similarity',
+            fontsize=12,
+            fontweight='bold'
+        )
+        ax.axis('off')
 
         plt.tight_layout()
 
@@ -264,7 +209,7 @@ Good variance: 0.10-0.20
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize frame-to-frame matches')
-    parser.add_argument('--checkpoint', type=str, required=True,
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                        help='Path to config file')

@@ -1,6 +1,6 @@
 """
-Simplified Descriptor Refiner following R2D2 best practices
-FIXED: Proper architecture, L2 norm at the END only
+Improved Descriptor Refiner with Residual Connections
+Following DINO-VO and R2D2 best practices for discriminative descriptors
 """
 
 import torch
@@ -12,38 +12,42 @@ class DescriptorRefiner(nn.Module):
     """
     Refine DINOv3 384-dim features → compact 128-dim descriptors.
 
-    Key principles from R2D2/SuperPoint:
-    1. Simple MLP (3 layers, no batchnorm inside)
-    2. L2 normalization ONLY at the very end
-    3. Orthogonal initialization for diversity
+    IMPROVEMENTS over v1:
+    1. Residual connections for better gradient flow
+    2. Slightly more capacity (384 hidden instead of 256)
+    3. LayerNorm for stability
+    4. Still L2 norm only at the end (per R2D2)
     """
 
     def __init__(
         self,
         input_dim: int = 384,
-        hidden_dim: int = 256,
-        output_dim: int = 128
+        hidden_dim: int = 384,  # Increased from 256
+        output_dim: int = 128,
+        num_layers: int = 4     # Increased from 3
     ):
         super().__init__()
 
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Simple 3-layer MLP (no normalization inside!)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # Residual blocks (with LayerNorm for stability)
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim) for _ in range(num_layers - 2)
+        ])
+
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
 
         self._init_weights()
 
     def _init_weights(self):
         """
         Orthogonal initialization for maximum diversity.
-        This prevents descriptor collapse.
+        Critical for preventing descriptor collapse.
         """
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -68,13 +72,55 @@ class DescriptorRefiner(nn.Module):
         # Flatten
         x = dino_features.reshape(B * N, C)
 
-        # Apply MLP (no normalization inside!)
-        descriptors = self.mlp(x)
+        # Input projection
+        x = F.relu(self.input_proj(x))
 
-        # L2 normalize ONLY at the very end
+        # Residual blocks (better gradient flow)
+        for block in self.residual_blocks:
+            x = block(x)
+
+        # Output projection
+        descriptors = self.output_proj(x)
+
+        # L2 normalize ONLY at the very end (per R2D2/DINO-VO)
         descriptors = F.normalize(descriptors, p=2, dim=-1)
 
         # Reshape back
         descriptors = descriptors.reshape(B, N, self.output_dim)
 
         return descriptors
+
+
+class ResidualBlock(nn.Module):
+    """
+    Simple residual block with LayerNorm.
+    Helps with gradient flow and training stability.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.fc2 = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Residual block: x + F(x)
+        """
+        identity = x
+
+        # First transform
+        out = self.norm1(x)
+        out = F.relu(self.fc1(out))
+
+        # Second transform
+        out = self.norm2(out)
+        out = self.fc2(out)
+
+        # Residual connection
+        out = out + identity
+        out = F.relu(out)
+
+        return out

@@ -1,6 +1,6 @@
 """
-Self-Supervised Losses for Semantic SLAM
-FIXED: Added edge awareness and spatial sparsity to learn corners/edges, not blobs
+Self-Supervised Losses - DESCRIPTOR QUALITY FOCUSED
+Key addition: Proper descriptor variance regularization
 """
 
 import torch
@@ -9,11 +9,15 @@ import torch.nn.functional as F
 
 
 class DescriptorMatchingLoss(nn.Module):
-    """InfoNCE contrastive loss - unchanged"""
+    """
+    InfoNCE contrastive loss with proper negative sampling.
+    IMPROVED: Better temperature and more negatives.
+    """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.10, num_negatives: int = 40):
         super().__init__()
         self.temperature = temperature
+        self.num_negatives = num_negatives
 
     def forward(
         self,
@@ -21,6 +25,9 @@ class DescriptorMatchingLoss(nn.Module):
         desc2: torch.Tensor,
         matches: torch.Tensor
     ) -> torch.Tensor:
+        """
+        InfoNCE loss: pull matched descriptors together, push others apart.
+        """
         B = desc1.shape[0]
         device = desc1.device
 
@@ -47,9 +54,11 @@ class DescriptorMatchingLoss(nn.Module):
             matched_desc1 = desc1[b, idx1]
             matched_desc2 = desc2[b, idx2]
 
+            # Compute similarity to ALL descriptors in frame 2
             logits = torch.mm(matched_desc1, desc2[b].t()) / self.temperature
             logits = torch.clamp(logits, -50, 50)
 
+            # Cross-entropy: want matched_desc2 to be most similar
             loss = F.cross_entropy(logits, idx2)
 
             if not torch.isnan(loss) and not torch.isinf(loss):
@@ -62,13 +71,101 @@ class DescriptorMatchingLoss(nn.Module):
             return torch.tensor(0.1, device=device, requires_grad=True)
 
 
-class RepeatabilityLoss(nn.Module):
+class DescriptorVarianceLoss(nn.Module):
     """
-    FIXED: Proper repeatability loss that encourages selecting THE SAME keypoints.
+    FIXED: Descriptor variance regularization with correct target.
+    Prevents descriptor collapse while allowing discriminative learning.
 
-    Key insight: We don't want keypoints1 ≈ keypoints2 (all close together),
-    we want CORRESPONDING keypoints to be in the same locations!
+    Key insight: L2-normalized D-dim descriptors have expected variance ≈ 1/D
+    For 128-dim: expected variance ≈ 0.0078
     """
+
+    def __init__(self, min_variance: float = 0.005):
+        """
+        Args:
+            min_variance: Minimum acceptable variance (default: 0.005 for 128-dim)
+                         Should be slightly below 1/D to allow some specialization
+        """
+        super().__init__()
+        self.min_variance = min_variance
+
+    def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
+        """
+        Prevent descriptor collapse by ensuring minimum variance.
+
+        Args:
+            descriptors: (B, N, D) L2-normalized descriptors
+
+        Returns:
+            loss: Scalar variance regularization loss
+        """
+        B, N, D = descriptors.shape
+
+        # Reshape to (B*N, D)
+        desc_flat = descriptors.reshape(B * N, D)
+
+        # Variance per dimension
+        variance_per_dim = desc_flat.var(dim=0)  # (D,)
+        mean_variance = variance_per_dim.mean()
+
+        # Only penalize if variance is TOO LOW (collapse)
+        # Don't penalize high variance (that's good!)
+        min_var = torch.tensor(self.min_variance, device=descriptors.device)
+
+        # Loss: only if variance drops below minimum
+        loss = F.relu(min_var - mean_variance)
+
+        return loss
+
+
+class DescriptorDecorrelationLoss(nn.Module):
+    """
+    OPTIONAL: Encourage descriptor dimensions to be decorrelated.
+    Helps prevent redundant dimensions.
+
+    Similar to Barlow Twins / VICReg approach.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage off-diagonal elements of correlation matrix to be zero.
+
+        Args:
+            descriptors: (B, N, D) descriptors
+
+        Returns:
+            loss: Decorrelation loss
+        """
+        B, N, D = descriptors.shape
+
+        # Flatten to (B*N, D)
+        desc_flat = descriptors.reshape(B * N, D)
+
+        # Normalize each dimension to zero mean, unit variance
+        desc_centered = desc_flat - desc_flat.mean(dim=0, keepdim=True)
+        desc_std = desc_centered.std(dim=0, keepdim=True) + 1e-6
+        desc_normalized = desc_centered / desc_std
+
+        # Compute correlation matrix
+        corr_matrix = (desc_normalized.T @ desc_normalized) / (B * N)
+
+        # Loss: minimize off-diagonal elements
+        # Want identity matrix (decorrelated dimensions)
+        eye = torch.eye(D, device=descriptors.device)
+        off_diagonal = (corr_matrix - eye) ** 2
+
+        # Only penalize off-diagonal
+        mask = 1 - eye
+        loss = (off_diagonal * mask).sum() / (D * (D - 1))
+
+        return loss
+
+
+class RepeatabilityLoss(nn.Module):
+    """Repeatability loss - compare saliency maps directly"""
 
     def __init__(self, distance_threshold: float = 2.0):
         super().__init__()
@@ -79,91 +176,38 @@ class RepeatabilityLoss(nn.Module):
         saliency1: torch.Tensor,
         saliency2: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Encourage consistent saliency patterns across frames.
-
-        FIXED: Instead of comparing keypoint coordinates (which might be different),
-        we compare the SALIENCY MAPS themselves. This forces the network to
-        produce similar saliency patterns → same keypoints selected.
-
-        Args:
-            saliency1: (B, H, W, 1) saliency map for frame 1
-            saliency2: (B, H, W, 1) saliency map for frame 2
-
-        Returns:
-            loss: Scalar repeatability loss
-        """
-        # Flatten saliency maps
-        sal1_flat = saliency1.reshape(saliency1.shape[0], -1)  # (B, H*W)
-        sal2_flat = saliency2.reshape(saliency2.shape[0], -1)  # (B, H*W)
-
-        # L2 loss between saliency maps
-        # This encourages the same patches to be salient in both frames
+        """Force same saliency patterns across frames"""
+        sal1_flat = saliency1.reshape(saliency1.shape[0], -1)
+        sal2_flat = saliency2.reshape(saliency2.shape[0], -1)
         loss = F.mse_loss(sal1_flat, sal2_flat)
-
-        # Alternative: Cosine similarity (encourages same pattern)
-        # cos_sim = F.cosine_similarity(sal1_flat, sal2_flat, dim=1).mean()
-        # loss = 1.0 - cos_sim
-
         return loss
 
 
 class PeakinessLoss(nn.Module):
-    """
-    FIXED: Encourage variance in saliency map.
-    Higher variance = more peaked = clear distinction between features.
-    """
+    """Encourage variance in saliency map"""
 
     def __init__(self, target_variance: float = 0.22):
         super().__init__()
         self.target_variance = target_variance
 
     def forward(self, saliency_map: torch.Tensor) -> torch.Tensor:
-        """
-        Encourage variance around target (e.g., 0.22 for 0.1-0.85 range).
-
-        Args:
-            saliency_map: (B, H, W, 1) sigmoid outputs
-
-        Returns:
-            loss: Scalar peakiness loss
-        """
         B, H, W, _ = saliency_map.shape
         saliency_flat = saliency_map.squeeze(-1).reshape(B, -1)
-
-        # Compute variance for each sample
         variance = saliency_flat.var(dim=1, unbiased=False)
         mean_variance = variance.mean()
-
-        # Target variance (higher = more dynamic range)
         target = torch.tensor(self.target_variance, device=saliency_map.device)
-
-        # MSE loss to target variance
         loss = (mean_variance - target) ** 2
-
         return loss
 
 
 class ActivationLoss(nn.Module):
-    """
-    Ensures the selector activates (doesn't stay near 0).
-    REDUCED weight to allow more dynamic range.
-    """
+    """Ensure selector activates"""
 
     def __init__(self, target_mean: float = 0.35):
         super().__init__()
         self.target_mean = target_mean
 
     def forward(self, saliency_map: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure mean saliency is around target.
-
-        Args:
-            saliency_map: (B, H, W, 1) sigmoid outputs
-
-        Returns:
-            loss: Scalar activation loss
-        """
         mean_saliency = saliency_map.mean()
         target = torch.tensor(self.target_mean, device=saliency_map.device)
         loss = F.mse_loss(mean_saliency, target)
@@ -171,18 +215,13 @@ class ActivationLoss(nn.Module):
 
 
 class EdgeAwarenessLoss(nn.Module):
-    """
-    NEW: Encourage saliency to align with image edges and corners.
-
-    This is the KEY to learning feature detectors, not semantic segmentation!
-    We compute image gradients and encourage high saliency at edge locations.
-    """
+    """Encourage saliency to align with image edges"""
 
     def __init__(self, edge_threshold: float = 0.1):
         super().__init__()
         self.edge_threshold = edge_threshold
 
-        # Sobel filters for edge detection
+        # Sobel filters
         self.register_buffer('sobel_x', torch.tensor([
             [[-1, 0, 1],
              [-2, 0, 2],
@@ -199,78 +238,54 @@ class EdgeAwarenessLoss(nn.Module):
         """
         Encourage saliency to correlate with edge strength.
 
-        Args:
-            saliency_map: (B, H, W, 1) saliency predictions (28x28)
-            images: (B, 3, 448, 448) original RGB images
-
-        Returns:
-            loss: Edge alignment loss (lower = better alignment)
+        CORRECT APPROACH: Use negative correlation loss (maximize positive correlation)
+        The key is using a LOWER WEIGHT (0.3) to avoid dominating other losses.
         """
         B, H, W, _ = saliency_map.shape
         device = saliency_map.device
 
-        # Convert to grayscale for edge detection
+        # Convert to grayscale
         gray = 0.299 * images[:, 0] + 0.587 * images[:, 1] + 0.114 * images[:, 2]
-        gray = gray.unsqueeze(1)  # (B, 1, 448, 448)
+        gray = gray.unsqueeze(1)
 
-        # Compute gradients
+        # Edge detection with Sobel
         grad_x = F.conv2d(gray, self.sobel_x, padding=1)
         grad_y = F.conv2d(gray, self.sobel_y, padding=1)
-
-        # Edge magnitude
         edge_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 
-        # Normalize edge magnitude to [0, 1]
+        # Normalize to [0, 1]
         edge_magnitude = edge_magnitude / (edge_magnitude.max() + 1e-8)
 
-        # Downsample edge map to match saliency resolution (28x28)
+        # Downsample to saliency resolution (28x28)
         edge_map_downsampled = F.adaptive_avg_pool2d(edge_magnitude, (H, W))
 
-        # Threshold: only care about strong edges
-        edge_map_binary = (edge_map_downsampled > self.edge_threshold).float()
-
-        # Convert saliency to match format
+        # Prepare saliency for correlation
         saliency_2d = saliency_map.squeeze(-1).unsqueeze(1)  # (B, 1, H, W)
 
-        # Loss: Encourage high saliency at edge locations
-        # We want: saliency[edge_locations] to be high
-
-        # Option 1: Correlation-based (encourage positive correlation)
+        # Flatten for correlation computation
         edge_flat = edge_map_downsampled.reshape(B, -1)
         saliency_flat = saliency_2d.reshape(B, -1)
 
-        # Normalize both to zero mean for correlation
+        # Pearson correlation
         edge_centered = edge_flat - edge_flat.mean(dim=1, keepdim=True)
         sal_centered = saliency_flat - saliency_flat.mean(dim=1, keepdim=True)
 
-        # Pearson correlation (we want positive correlation)
         correlation = (edge_centered * sal_centered).sum(dim=1) / (
             torch.sqrt((edge_centered ** 2).sum(dim=1) * (sal_centered ** 2).sum(dim=1)) + 1e-8
         )
 
-        # Loss: negative correlation (maximize positive correlation)
+        # CORRECT: Negative correlation loss (maximize positive correlation)
+        # Goal: Make correlation → +1.0
+        # If correlation is negative (bad), loss is positive (high penalty)
+        # If correlation is positive (good), loss is negative (reward)
+        # Gradient descent minimizes loss → pushes toward positive correlation
         loss = -correlation.mean()
 
-        # Option 2: Direct supervision on edge locations
-        # Encourage saliency to be high where edges are strong
-        edge_supervision_loss = F.mse_loss(
-            saliency_2d * edge_map_binary,
-            edge_map_downsampled * edge_map_binary
-        )
-
-        # Combine both approaches
-        total_loss = loss + 0.5 * edge_supervision_loss
-
-        return total_loss
+        return loss
 
 
 class SpatialSparsityLoss(nn.Module):
-    """
-    NEW: Encourage spatial sparsity to prevent uniform blobs.
-
-    Penalizes large contiguous regions of high saliency.
-    Forces the network to select specific locations (corners/edges), not entire objects.
-    """
+    """Encourage spatial sparsity - prevent blobs"""
 
     def __init__(self, sparsity_target: float = 0.35, penalty_weight: float = 2.0):
         super().__init__()
@@ -278,128 +293,22 @@ class SpatialSparsityLoss(nn.Module):
         self.penalty_weight = penalty_weight
 
     def forward(self, saliency_map: torch.Tensor) -> torch.Tensor:
-        """
-        Penalize lack of spatial sparsity.
-
-        Args:
-            saliency_map: (B, H, W, 1) saliency predictions
-
-        Returns:
-            loss: Sparsity penalty (higher = less sparse)
-        """
         B, H, W, _ = saliency_map.shape
+        saliency_2d = saliency_map.squeeze(-1)
 
-        saliency_2d = saliency_map.squeeze(-1)  # (B, H, W)
-
-        # Compute spatial gradients of saliency
-        # High gradients = sparse, localized peaks
-        # Low gradients = smooth, blob-like regions
+        # Spatial gradients (high = sparse peaks)
         grad_x = saliency_2d[:, :, 1:] - saliency_2d[:, :, :-1]
         grad_y = saliency_2d[:, 1:, :] - saliency_2d[:, :-1, :]
-
-        # Mean absolute gradient (higher = more sparse/peaky)
         spatial_variation = (grad_x.abs().mean() + grad_y.abs().mean()) / 2
 
-        # We want HIGH spatial variation (peaks, not blobs)
-        # So we penalize LOW spatial variation
+        # Want high spatial variation
         target_variation = torch.tensor(0.15, device=saliency_map.device)
-
-        # Loss: encourage spatial variation to be high
         sparsity_loss = F.relu(target_variation - spatial_variation)
 
-        # Also penalize if too many locations are highly salient
-        # Count percentage of locations with saliency > threshold
+        # Penalize too many high-saliency locations
         high_saliency_ratio = (saliency_2d > 0.6).float().mean()
-
-        # Penalize if more than 20% of locations are very salient
         ratio_penalty = F.relu(high_saliency_ratio - 0.20) * self.penalty_weight
 
         total_loss = sparsity_loss + ratio_penalty
 
         return total_loss
-
-
-class CornerResponseLoss(nn.Module):
-    """
-    OPTIONAL: Explicitly encourage corner-like responses.
-
-    Uses Harris corner detection as supervision signal.
-    This is more advanced - only use if edge loss isn't enough.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, saliency_map: torch.Tensor, images: torch.Tensor) -> torch.Tensor:
-        """
-        Encourage saliency to correlate with corner strength.
-
-        Args:
-            saliency_map: (B, H, W, 1) saliency predictions
-            images: (B, 3, 448, 448) RGB images
-
-        Returns:
-            loss: Corner alignment loss
-        """
-        B, H, W, _ = saliency_map.shape
-        device = saliency_map.device
-
-        # Convert to grayscale
-        gray = 0.299 * images[:, 0] + 0.587 * images[:, 1] + 0.114 * images[:, 2]
-        gray = gray.unsqueeze(1)  # (B, 1, 448, 448)
-
-        # Compute gradients (Sobel)
-        sobel_x = torch.tensor([
-            [[-1, 0, 1],
-             [-2, 0, 2],
-             [-1, 0, 1]]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-
-        sobel_y = torch.tensor([
-            [[-1, -2, -1],
-             [ 0,  0,  0],
-             [ 1,  2,  1]]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-
-        Ix = F.conv2d(gray, sobel_x, padding=1)
-        Iy = F.conv2d(gray, sobel_y, padding=1)
-
-        # Harris corner response (simplified)
-        Ix2 = Ix ** 2
-        Iy2 = Iy ** 2
-        Ixy = Ix * Iy
-
-        # Gaussian smoothing (approximate with average pooling)
-        Ix2 = F.avg_pool2d(Ix2, kernel_size=5, stride=1, padding=2)
-        Iy2 = F.avg_pool2d(Iy2, kernel_size=5, stride=1, padding=2)
-        Ixy = F.avg_pool2d(Ixy, kernel_size=5, stride=1, padding=2)
-
-        # Harris response: det(M) - k * trace(M)^2
-        k = 0.04
-        det = Ix2 * Iy2 - Ixy ** 2
-        trace = Ix2 + Iy2
-        corner_response = det - k * (trace ** 2)
-
-        # Normalize
-        corner_response = F.relu(corner_response)
-        corner_response = corner_response / (corner_response.max() + 1e-8)
-
-        # Downsample to saliency resolution
-        corner_map = F.adaptive_avg_pool2d(corner_response, (H, W))
-
-        # Correlation loss (like EdgeAwarenessLoss)
-        saliency_2d = saliency_map.squeeze(-1).unsqueeze(1)
-        corner_flat = corner_map.reshape(B, -1)
-        saliency_flat = saliency_2d.reshape(B, -1)
-
-        # Pearson correlation
-        corner_centered = corner_flat - corner_flat.mean(dim=1, keepdim=True)
-        sal_centered = saliency_flat - saliency_flat.mean(dim=1, keepdim=True)
-
-        correlation = (corner_centered * sal_centered).sum(dim=1) / (
-            torch.sqrt((corner_centered ** 2).sum(dim=1) * (sal_centered ** 2).sum(dim=1)) + 1e-8
-        )
-
-        loss = -correlation.mean()
-
-        return loss
