@@ -1,10 +1,9 @@
 """
-SIMPLIFIED Training Script
-CRITICAL FIXES:
-1. Only 3 losses (descriptor, repeatability, sparsity)
-2. All coordinates in PATCH space
-3. Grid-aligned keypoint selection
-4. Proper DINOv3 feature normalization
+FIXED Training Script - Edge and Corner Aware
+Key additions:
+1. EdgeAwarenessLoss - align saliency with image gradients
+2. SpatialSparsityLoss - prevent uniform blobs
+3. Better loss balancing for 0.1-0.85 range
 """
 
 import os
@@ -29,25 +28,27 @@ from losses.self_supervised import (
     DescriptorMatchingLoss,
     RepeatabilityLoss,
     PeakinessLoss,
-    ActivationLoss
+    ActivationLoss,
+    EdgeAwarenessLoss,  # NEW
+    SpatialSparsityLoss  # NEW
 )
 
 
 class SemanticSLAMTrainer:
-    """Simplified trainer with 3 core losses"""
+    """Trainer with edge and corner awareness"""
 
     def __init__(self, config: Dict):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         print("\n" + "="*70)
-        print("SEMANTIC SLAM TRAINING - SIMPLIFIED & FIXED")
+        print("SEMANTIC SLAM TRAINING - EDGE & CORNER AWARE")
         print("="*70)
         print("Key improvements:")
-        print("  ✓ Grid-aligned keypoints (DINO-VO best practice)")
-        print("  ✓ Only 3 core losses (down from 7)")
-        print("  ✓ All coordinates in PATCH space")
-        print("  ✓ Proper DINOv3 feature normalization")
+        print("  ✓ Edge awareness loss (align with image gradients)")
+        print("  ✓ Spatial sparsity loss (prevent blobs)")
+        print("  ✓ Higher variance target (0.1-0.85 range)")
+        print("  ✓ Optimized for corners/edges, not objects")
         print("="*70 + "\n")
 
         # Initialize models
@@ -86,15 +87,27 @@ class SemanticSLAMTrainer:
         self.repeat_loss = RepeatabilityLoss(
             distance_threshold=config['loss']['repeat_threshold']
         )
-        self.peakiness_loss = PeakinessLoss()
-        self.activation_loss = ActivationLoss(
-            target_mean=config['loss']['target_activation']
+        self.peakiness_loss = PeakinessLoss(
+            target_variance=config['loss']['target_variance']
         )
+        self.activation_loss = ActivationLoss(
+            target_mean=config['loss']['sparsity_target']
+        )
+
+        # NEW LOSSES - MUST MOVE TO DEVICE!
+        self.edge_loss = EdgeAwarenessLoss(
+            edge_threshold=config['loss']['edge_threshold']
+        ).to(self.device)  # FIXED: Move to CUDA
+        self.sparsity_loss = SpatialSparsityLoss(
+            sparsity_target=config['loss']['sparsity_target'],
+            penalty_weight=config['loss']['sparsity_penalty']
+        ).to(self.device)  # FIXED: Move to CUDA
 
         # Loss weights
         self.loss_weights = config['loss']['weights']
         print(f"  ✓ Loss weights: {self.loss_weights}")
-        print(f"  ✓ Total losses: 4 (descriptor, repeatability, peakiness, activation)")
+        print(f"  ✓ Total losses: 6 (desc, repeat, peakiness, activation, edge, sparsity)")
+        print(f"  ✓ Target variance: {config['loss']['target_variance']}")
 
         # Optimizer
         self.optimizer = AdamW(
@@ -188,14 +201,18 @@ class SemanticSLAMTrainer:
             'desc': 0.0,
             'repeat': 0.0,
             'peakiness': 0.0,
-            'activation': 0.0
+            'activation': 0.0,
+            'edge': 0.0,
+            'sparsity': 0.0
         }
 
         # Metrics
         metrics = {
             'num_matches': [],
             'mean_saliency': [],
-            'max_saliency': []
+            'max_saliency': [],
+            'min_saliency': [],
+            'saliency_variance': []
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:2d}")
@@ -234,9 +251,10 @@ class SemanticSLAMTrainer:
             pbar.set_postfix({
                 'loss': f"{loss.item():.3f}",
                 'desc': f"{loss_components['desc']:.3f}",
+                'edge': f"{loss_components['edge']:.3f}",
                 'matches': f"{batch_metrics.get('num_matches', 0):.0f}",
                 'sal_max': f"{batch_metrics.get('max_saliency', 0):.3f}",
-                'sal_mean': f"{batch_metrics.get('mean_saliency', 0):.3f}"
+                'sal_var': f"{batch_metrics.get('saliency_variance', 0):.3f}"
             })
 
             self.global_step += 1
@@ -249,9 +267,13 @@ class SemanticSLAMTrainer:
                     'batch/repeat': loss_components['repeat'],
                     'batch/peakiness': loss_components['peakiness'],
                     'batch/activation': loss_components['activation'],
+                    'batch/edge': loss_components['edge'],
+                    'batch/sparsity': loss_components['sparsity'],
                     'batch/matches': batch_metrics.get('num_matches', 0),
                     'batch/sal_mean': batch_metrics.get('mean_saliency', 0),
                     'batch/sal_max': batch_metrics.get('max_saliency', 0),
+                    'batch/sal_min': batch_metrics.get('min_saliency', 0),
+                    'batch/sal_variance': batch_metrics.get('saliency_variance', 0),
                     'step': self.global_step
                 })
 
@@ -273,7 +295,7 @@ class SemanticSLAMTrainer:
         rgb1: torch.Tensor,
         rgb2: torch.Tensor
     ) -> tuple:
-        """Complete forward pass"""
+        """Complete forward pass with NEW losses"""
 
         # Extract DINOv3 features (in PATCH space!)
         with torch.no_grad():
@@ -284,7 +306,7 @@ class SemanticSLAMTrainer:
         saliency1 = self.selector(feat1)
         saliency2 = self.selector(feat2)
 
-        # Check for NaN in saliency
+        # Safety checks
         if torch.isnan(saliency1).any():
             print("⚠️ NaN in saliency1!")
             saliency1 = torch.sigmoid(torch.zeros_like(saliency1))
@@ -315,16 +337,22 @@ class SemanticSLAMTrainer:
         matches = self._find_matches(desc1, desc2)
         loss_desc = self.desc_loss(desc1, desc2, matches)
 
-        # 2. Repeatability loss (simple L2 distance)
-        loss_repeat = self.repeat_loss(kpts1, kpts2)
+        # 2. Repeatability loss (FIXED: compare saliency maps, not keypoints!)
+        loss_repeat = self.repeat_loss(saliency1, saliency2)
 
         # 3. Peakiness loss (variance-based)
         loss_peakiness = self.peakiness_loss(saliency1)
 
-        # 4. Activation loss (ensure selector activates)
+        # 4. Activation loss
         loss_activation = self.activation_loss(saliency1)
 
-        # Replace NaN with zeros
+        # 5. NEW: Edge awareness loss (align with image gradients)
+        loss_edge = self.edge_loss(saliency1, rgb1)
+
+        # 6. NEW: Spatial sparsity loss (prevent blobs)
+        loss_sparsity = self.sparsity_loss(saliency1)
+
+        # Replace NaN with fallback
         if torch.isnan(loss_desc):
             loss_desc = torch.tensor(0.1, device=loss_desc.device, requires_grad=True)
         if torch.isnan(loss_repeat):
@@ -333,6 +361,10 @@ class SemanticSLAMTrainer:
             loss_peakiness = torch.tensor(0.0, device=loss_peakiness.device, requires_grad=True)
         if torch.isnan(loss_activation):
             loss_activation = torch.tensor(0.0, device=loss_activation.device, requires_grad=True)
+        if torch.isnan(loss_edge):
+            loss_edge = torch.tensor(0.0, device=loss_edge.device, requires_grad=True)
+        if torch.isnan(loss_sparsity):
+            loss_sparsity = torch.tensor(0.0, device=loss_sparsity.device, requires_grad=True)
 
         # Weighted combination
         w = self.loss_weights
@@ -340,20 +372,28 @@ class SemanticSLAMTrainer:
             w['desc'] * loss_desc +
             w['repeat'] * loss_repeat +
             w['peakiness'] * loss_peakiness +
-            w['activation'] * loss_activation
+            w['activation'] * loss_activation +
+            w['edge'] * loss_edge +
+            w['sparsity'] * loss_sparsity
         )
 
         loss_components = {
             'desc': loss_desc.item(),
             'repeat': loss_repeat.item(),
             'peakiness': loss_peakiness.item(),
-            'activation': loss_activation.item()
+            'activation': loss_activation.item(),
+            'edge': loss_edge.item(),
+            'sparsity': loss_sparsity.item()
         }
 
+        # Compute saliency statistics
+        sal_np = saliency1.detach().cpu().numpy()
         batch_metrics = {
             'num_matches': matches.shape[1],
-            'mean_saliency': saliency1.mean().item() if not torch.isnan(saliency1.mean()) else 0.0,
-            'max_saliency': saliency1.max().item() if not torch.isnan(saliency1.max()) else 0.0
+            'mean_saliency': float(np.mean(sal_np)),
+            'max_saliency': float(np.max(sal_np)),
+            'min_saliency': float(np.min(sal_np)),
+            'saliency_variance': float(np.var(sal_np))
         }
 
         return total_loss, loss_components, batch_metrics
@@ -405,8 +445,21 @@ class SemanticSLAMTrainer:
         self.refiner.eval()
 
         total_loss = 0.0
-        losses_dict = {'desc': 0.0, 'repeat': 0.0, 'peakiness': 0.0, 'activation': 0.0}
-        metrics = {'num_matches': [], 'mean_saliency': [], 'max_saliency': []}
+        losses_dict = {
+            'desc': 0.0,
+            'repeat': 0.0,
+            'peakiness': 0.0,
+            'activation': 0.0,
+            'edge': 0.0,
+            'sparsity': 0.0
+        }
+        metrics = {
+            'num_matches': [],
+            'mean_saliency': [],
+            'max_saliency': [],
+            'min_saliency': [],
+            'saliency_variance': []
+        }
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation", leave=False):
@@ -449,18 +502,32 @@ class SemanticSLAMTrainer:
                 print(f"\n{'='*70}")
                 print(f"EPOCH {epoch}/{self.config['training']['epochs']}")
                 print(f"{'='*70}")
-                print(f"{'Metric':<20} {'Train':>12} {'Val':>12}")
+                print(f"{'Metric':<25} {'Train':>12} {'Val':>12}")
                 print(f"{'-'*70}")
-                print(f"{'Total Loss':<20} {train_losses['total']:>12.4f} {val_losses['total']:>12.4f}")
-                print(f"{'  Descriptor':<20} {train_losses['desc']:>12.4f} {val_losses['desc']:>12.4f}")
-                print(f"{'  Repeatability':<20} {train_losses['repeat']:>12.4f} {val_losses['repeat']:>12.4f}")
-                print(f"{'  Peakiness':<20} {train_losses['peakiness']:>12.4f} {val_losses['peakiness']:>12.4f}")
-                print(f"{'  Activation':<20} {train_losses['activation']:>12.4f} {val_losses['activation']:>12.4f}")
+                print(f"{'Total Loss':<25} {train_losses['total']:>12.4f} {val_losses['total']:>12.4f}")
+                print(f"{'  Descriptor':<25} {train_losses['desc']:>12.4f} {val_losses['desc']:>12.4f}")
+                print(f"{'  Repeatability':<25} {train_losses['repeat']:>12.4f} {val_losses['repeat']:>12.4f}")
+                print(f"{'  Peakiness':<25} {train_losses['peakiness']:>12.4f} {val_losses['peakiness']:>12.4f}")
+                print(f"{'  Activation':<25} {train_losses['activation']:>12.4f} {val_losses['activation']:>12.4f}")
+                print(f"{'  Edge Awareness':<25} {train_losses['edge']:>12.4f} {val_losses['edge']:>12.4f}")
+                print(f"{'  Spatial Sparsity':<25} {train_losses['sparsity']:>12.4f} {val_losses['sparsity']:>12.4f}")
                 print(f"{'-'*70}")
-                print(f"{'Matches':<20} {train_losses.get('num_matches', 0):>12.1f} {val_losses.get('num_matches', 0):>12.1f}")
-                print(f"{'Mean Saliency':<20} {train_losses.get('mean_saliency', 0):>12.3f} {val_losses.get('mean_saliency', 0):>12.3f}")
-                print(f"{'Max Saliency':<20} {train_losses.get('max_saliency', 0):>12.3f} {val_losses.get('max_saliency', 0):>12.3f}")
+                print(f"{'Matches':<25} {train_losses.get('num_matches', 0):>12.1f} {val_losses.get('num_matches', 0):>12.1f}")
+                print(f"{'Mean Saliency':<25} {train_losses.get('mean_saliency', 0):>12.3f} {val_losses.get('mean_saliency', 0):>12.3f}")
+                print(f"{'Max Saliency':<25} {train_losses.get('max_saliency', 0):>12.3f} {val_losses.get('max_saliency', 0):>12.3f}")
+                print(f"{'Min Saliency':<25} {train_losses.get('min_saliency', 0):>12.3f} {val_losses.get('min_saliency', 0):>12.3f}")
+                print(f"{'Saliency Variance':<25} {train_losses.get('saliency_variance', 0):>12.3f} {val_losses.get('saliency_variance', 0):>12.3f}")
                 print(f"{'='*70}\n")
+
+                # Check if we're reaching target statistics
+                val_var = val_losses.get('saliency_variance', 0)
+                val_max = val_losses.get('max_saliency', 0)
+                if val_var > 0.15 and val_max > 0.65:
+                    print("✅ Good saliency statistics! Network learning edge/corner features.")
+                elif val_var < 0.05:
+                    print("⚠️ Low variance - network might not be learning enough distinction.")
+                elif val_max > 0.95:
+                    print("⚠️ Saturating to extremes - consider reducing edge loss weight.")
 
                 # Log to wandb
                 if self.config['logging']['use_wandb']:
@@ -471,11 +538,15 @@ class SemanticSLAMTrainer:
                         'train/repeat': train_losses['repeat'],
                         'train/peakiness': train_losses['peakiness'],
                         'train/activation': train_losses['activation'],
+                        'train/edge': train_losses['edge'],
+                        'train/sparsity': train_losses['sparsity'],
                         'val/total': val_losses['total'],
                         'val/desc': val_losses['desc'],
                         'val/repeat': val_losses['repeat'],
                         'val/peakiness': val_losses['peakiness'],
-                        'val/activation': val_losses['activation']
+                        'val/activation': val_losses['activation'],
+                        'val/edge': val_losses['edge'],
+                        'val/sparsity': val_losses['sparsity']
                     })
 
                 # Save best
