@@ -1,6 +1,6 @@
 """
-TUM RGB-D Dataset Loader
-FIXED: Added data augmentation for better generalization
+TUM RGB-D Dataset Loader - WITH TEMPORAL ROBUSTNESS
+CRITICAL FIX: Random frame spacing during training for temporal consistency
 """
 
 import os
@@ -9,15 +9,17 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Union
 import torchvision.transforms as transforms
 import random
 
 
 class TUMDataset(Dataset):
     """
-    TUM RGB-D dataset for self-supervised training.
-    Returns pairs of consecutive frames with depth and pose information.
+    TUM RGB-D dataset with temporal robustness training.
+
+    KEY FEATURE: Randomly samples frame pairs with varying spacing
+    to learn temporally consistent descriptors.
     """
 
     def __init__(
@@ -25,7 +27,8 @@ class TUMDataset(Dataset):
         dataset_root: str,
         sequence: str,
         input_size: int = 448,
-        frame_spacing: int = 1,
+        frame_spacing: Union[int, List[int], str] = 1,
+        frame_spacing_mode: str = "fixed",
         max_frames: Optional[int] = None,
         augmentation: Optional[dict] = None,
         is_train: bool = True
@@ -35,10 +38,11 @@ class TUMDataset(Dataset):
             dataset_root: Path to TUM RGB-D dataset root
             sequence: Sequence name
             input_size: Image size for DINOv3
-            frame_spacing: Spacing between consecutive frames
+            frame_spacing: Frame gap (int) or range (list) or "random"
+            frame_spacing_mode: "fixed", "random", or "curriculum"
             max_frames: Maximum frames to use
-            augmentation: Dict with augmentation params (only applied if is_train=True)
-            is_train: Whether this is training (apply augmentation) or validation
+            augmentation: Dict with augmentation params
+            is_train: Whether this is training (apply spacing randomization)
         """
         dataset_root_path = Path(dataset_root)
         if not dataset_root_path.is_absolute():
@@ -48,25 +52,36 @@ class TUMDataset(Dataset):
         self.dataset_root = dataset_root_path
         self.sequence = sequence
         self.input_size = input_size
-        self.frame_spacing = frame_spacing
         self.is_train = is_train
+
+        # TEMPORAL ROBUSTNESS: Handle different spacing modes
+        self.frame_spacing_mode = frame_spacing_mode
+
+        if isinstance(frame_spacing, list):
+            # List of possible spacings: [1, 2, 3, 5, 7]
+            self.frame_spacing_range = frame_spacing
+            self.frame_spacing = max(frame_spacing)  # Max for dataset length
+        elif isinstance(frame_spacing, int):
+            # Single spacing value
+            self.frame_spacing = frame_spacing
+            self.frame_spacing_range = [frame_spacing]
+        else:
+            # Default
+            self.frame_spacing = 1
+            self.frame_spacing_range = [1]
 
         # Paths
         candidate_sequence_dir = self.dataset_root / sequence
         if candidate_sequence_dir.exists():
             self.sequence_dir = candidate_sequence_dir
         else:
-            # Allow dataset_root to point directly to a sequence directory
             self.sequence_dir = self.dataset_root
         self.rgb_dir = self.sequence_dir / "rgb"
         self.depth_dir = self.sequence_dir / "depth"
         self.gt_file = self.sequence_dir / "groundtruth.txt"
 
         # Verify paths
-        assert self.sequence_dir.exists(), (
-            "Sequence not found. Checked: "
-            f"{candidate_sequence_dir} and {self.dataset_root}"
-        )
+        assert self.sequence_dir.exists(), f"Sequence not found: {self.sequence_dir}"
         assert self.rgb_dir.exists(), f"RGB directory not found: {self.rgb_dir}"
         assert self.depth_dir.exists(), f"Depth directory not found: {self.depth_dir}"
 
@@ -84,7 +99,7 @@ class TUMDataset(Dataset):
             if self.poses is not None:
                 self.poses = self.poses[:max_frames]
 
-        # Base transforms (no augmentation)
+        # Base transforms
         self.base_transform = transforms.Compose([
             transforms.Resize((input_size, input_size)),
             transforms.ToTensor(),
@@ -94,16 +109,16 @@ class TUMDataset(Dataset):
             )
         ])
 
-        # Augmentation transforms (following R2D2/SuperPoint)
+        # Augmentation
         self.augmentation = augmentation if (augmentation and is_train) else None
         if self.augmentation and self.augmentation.get('enabled', False):
             self.color_jitter = transforms.ColorJitter(
-                brightness=augmentation.get('brightness', 0.2),
-                contrast=augmentation.get('contrast', 0.2),
-                saturation=augmentation.get('saturation', 0.2),
-                hue=augmentation.get('hue', 0.1)
+                brightness=float(augmentation.get('brightness', 0.2)),
+                contrast=float(augmentation.get('contrast', 0.2)),
+                saturation=float(augmentation.get('saturation', 0.2)),
+                hue=float(augmentation.get('hue', 0.1))
             )
-            self.blur_prob = augmentation.get('gaussian_blur', 0.3)
+            self.blur_prob = float(augmentation.get('gaussian_blur', 0.3))
             self.gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
 
         self.depth_transform = transforms.Compose([
@@ -114,18 +129,38 @@ class TUMDataset(Dataset):
         print(f"Loaded TUM sequence: {sequence}")
         print(f"  Frames: {len(self.rgb_files)}")
         print(f"  Input size: {input_size}x{input_size}")
-        print(f"  Frame spacing: {frame_spacing}")
+        print(f"  Frame spacing mode: {self.frame_spacing_mode}")
+        if self.frame_spacing_mode == "random":
+            print(f"  Spacing range: {self.frame_spacing_range}")
+        else:
+            print(f"  Frame spacing: {self.frame_spacing}")
         print(f"  Augmentation: {'enabled' if self.augmentation else 'disabled'}")
 
     def __len__(self) -> int:
+        # Use max spacing for length calculation
         return max(0, len(self.rgb_files) - self.frame_spacing)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Returns a pair of consecutive frames with metadata.
+        Returns a pair of frames with RANDOM SPACING (if training).
+        This is the KEY to temporal robustness!
         """
         idx1 = idx
-        idx2 = idx + self.frame_spacing
+
+        # TEMPORAL ROBUSTNESS: Sample random spacing during training
+        if self.is_train and self.frame_spacing_mode == "random":
+            # Randomly choose spacing from range
+            spacing = random.choice(self.frame_spacing_range)
+
+            # Ensure idx2 is valid
+            max_spacing = len(self.rgb_files) - idx1 - 1
+            spacing = min(spacing, max_spacing)
+            spacing = max(spacing, 1)  # At least 1
+        else:
+            # Fixed spacing (validation/test or fixed mode)
+            spacing = self.frame_spacing
+
+        idx2 = idx1 + spacing
 
         # Load RGB images
         rgb1 = Image.open(self.rgb_dir / self.rgb_files[idx1]).convert("RGB")
@@ -135,20 +170,15 @@ class TUMDataset(Dataset):
         depth1 = Image.open(self.depth_dir / self.depth_files[idx1])
         depth2 = Image.open(self.depth_dir / self.depth_files[idx2])
 
-        # Convert depth to meters (TUM uses scale 5000)
+        # Convert depth to meters
         depth1_array = np.array(depth1).astype(np.float32) / 5000.0
         depth2_array = np.array(depth2).astype(np.float32) / 5000.0
 
-        # Apply augmentation to RGB (not depth!)
+        # Apply augmentation
         if self.augmentation:
-            # Same augmentation for both frames (consistency)
             seed = random.randint(0, 2**32 - 1)
-
-            # Frame 1
             random.seed(seed)
             rgb1 = self._apply_augmentation(rgb1)
-
-            # Frame 2 (same augmentation)
             random.seed(seed)
             rgb2 = self._apply_augmentation(rgb2)
 
@@ -179,15 +209,14 @@ class TUMDataset(Dataset):
             'depth1': depth1_tensor,
             'depth2': depth2_tensor,
             'timestamp1': self.timestamps[idx1],
-            'timestamp2': self.timestamps[idx2]
+            'timestamp2': self.timestamps[idx2],
+            'frame_spacing': spacing  # NEW: Include actual spacing used
         }
 
         # Add poses if available
         if self.poses is not None:
             pose1 = self.poses[idx1]
             pose2 = self.poses[idx2]
-
-            # Relative pose: T_rel = T2 @ T1^-1
             relative_pose = pose2 @ np.linalg.inv(pose1)
 
             output['pose1'] = torch.from_numpy(pose1).float()
@@ -198,13 +227,9 @@ class TUMDataset(Dataset):
 
     def _apply_augmentation(self, image: Image.Image) -> Image.Image:
         """Apply color jitter and blur augmentation"""
-        # Color jitter
         image = self.color_jitter(image)
-
-        # Gaussian blur (with probability)
         if random.random() < self.blur_prob:
             image = self.gaussian_blur(image)
-
         return image
 
     def _load_associations(self) -> Tuple[list, list, list]:
@@ -212,10 +237,8 @@ class TUMDataset(Dataset):
         rgb_files = sorted([f for f in os.listdir(self.rgb_dir) if f.endswith('.png')])
         depth_files = sorted([f for f in os.listdir(self.depth_dir) if f.endswith('.png')])
 
-        # Extract timestamps
         timestamps = [float(f.split('.')[0]) for f in rgb_files]
 
-        # Ensure same length
         min_len = min(len(rgb_files), len(depth_files))
         rgb_files = rgb_files[:min_len]
         depth_files = depth_files[:min_len]

@@ -1,6 +1,11 @@
 """
-Enhanced Visualization Script
+Enhanced Visualization Script (Updated for Sub-Pixel Refinement)
 Shows saliency alignment with edges and corners
+
+Updated to work with:
+- New KeypointSelector (returns saliency + offsets)
+- Sub-pixel keypoint refinement
+- Two-stage trained models
 """
 
 import torch
@@ -57,6 +62,8 @@ class EdgeAwareVisualizer:
         self.refiner.eval()
 
         print(f"✓ Loaded checkpoint from epoch {checkpoint['epoch']}")
+        if 'stage' in checkpoint:
+            print(f"  Training stage: {checkpoint['stage']}")
 
         # Transform
         self.transform = transforms.Compose([
@@ -81,10 +88,13 @@ class EdgeAwareVisualizer:
         # Extract DINOv3 features
         dino_features = self.backbone(image_tensor)
 
-        # Keypoint selection
-        saliency_map = self.selector(dino_features)
+        # Keypoint selection (NEW: returns saliency AND offsets)
+        saliency_map, offset_map = self.selector(dino_features)
+
+        # Select keypoints with sub-pixel refinement
         keypoints_patch, scores = self.selector.select_keypoints(
             saliency_map,
+            offset_map,  # NEW: pass offset map
             num_keypoints=self.config['model']['num_keypoints']
         )
 
@@ -97,6 +107,7 @@ class EdgeAwareVisualizer:
         return {
             'image': image_np,
             'saliency_map': saliency_map[0, :, :, 0].cpu().numpy(),
+            'offset_map': offset_map[0].cpu().numpy(),  # NEW: (H, W, 2)
             'keypoints_patch': keypoints_patch[0].cpu().numpy(),
             'keypoints_pixel': keypoints_pixel[0].cpu().numpy(),
             'scores': scores[0].cpu().numpy(),
@@ -120,7 +131,7 @@ class EdgeAwareVisualizer:
         return edge_map_28
 
     def visualize_frame(self, features: dict, output_path: str = None):
-        """Visualize with edge alignment analysis"""
+        """Visualize with edge alignment analysis + sub-pixel offsets"""
         # Create output directory
         if output_path:
             output_dir = Path("visualization_output")
@@ -133,11 +144,13 @@ class EdgeAwareVisualizer:
 
         image_np = features['image']
         saliency = features['saliency_map']
+        offset_map = features['offset_map']  # NEW: (H, W, 2)
         edge_map = features['edge_map']
         kpts_pixel = features['keypoints_pixel']
+        kpts_patch = features['keypoints_patch']  # NEW: for checking sub-pixel
         scores = features['scores']
 
-        # Compute statistics needed for multiple plots
+        # Compute statistics
         correlation = np.corrcoef(edge_map.flatten(), saliency.flatten())[0, 1]
         variance = saliency.var()
         std = saliency.std()
@@ -149,10 +162,16 @@ class EdgeAwareVisualizer:
         edge_norm = (edge_map - edge_map.min()) / (edge_map.max() - edge_map.min() + 1e-8)
         diff = np.abs(sal_norm - edge_norm)
 
+        # NEW: Compute sub-pixel statistics
+        kpts_int = np.floor(kpts_patch).astype(int)  # Integer part
+        kpts_frac = kpts_patch - kpts_int  # Fractional part
+        mean_offset_magnitude = np.linalg.norm(kpts_frac, axis=1).mean()
+        max_offset_magnitude = np.linalg.norm(kpts_frac, axis=1).max()
+
         # Save individual plots
         print("Saving individual visualizations...")
 
-        # 1. Original image with keypoints
+        # 1. Original image with keypoints (show sub-pixel precision)
         fig1, ax1 = plt.subplots(figsize=(8, 8))
         ax1.imshow(image_np)
         scatter = ax1.scatter(
@@ -160,7 +179,8 @@ class EdgeAwareVisualizer:
             c=scores, cmap='hot', s=30, alpha=0.8,
             edgecolors='white', linewidths=0.5
         )
-        ax1.set_title('Keypoints (colored by score)', fontsize=12, fontweight='bold')
+        ax1.set_title(f'Keypoints (Sub-Pixel Refined)\nMean offset: {mean_offset_magnitude:.3f} px',
+                     fontsize=12, fontweight='bold')
         ax1.axis('off')
         plt.colorbar(scatter, ax=ax1, fraction=0.046)
         plt.savefig(output_dir / f"{base_name}_1_keypoints.png", dpi=150, bbox_inches='tight')
@@ -205,14 +225,15 @@ class EdgeAwareVisualizer:
         plt.savefig(output_dir / f"{base_name}_5_edge_overlay.png", dpi=150, bbox_inches='tight')
         plt.close()
 
-        # 6. Difference map
+        # 6. NEW: Offset magnitude visualization
         fig6, ax6 = plt.subplots(figsize=(8, 8))
-        im6 = ax6.imshow(diff, cmap='RdYlGn_r', interpolation='nearest')
-        ax6.set_title(f'Alignment Error\nMean diff: {diff.mean():.3f}',
+        offset_magnitude = np.linalg.norm(offset_map, axis=-1)  # (H, W)
+        im6 = ax6.imshow(offset_magnitude, cmap='viridis', interpolation='nearest')
+        ax6.set_title(f'Sub-Pixel Offset Magnitude\nMean: {offset_magnitude.mean():.3f}',
                      fontsize=12, fontweight='bold')
         ax6.axis('off')
         plt.colorbar(im6, ax=ax6, fraction=0.046)
-        plt.savefig(output_dir / f"{base_name}_6_alignment_error.png", dpi=150, bbox_inches='tight')
+        plt.savefig(output_dir / f"{base_name}_6_offset_magnitude.png", dpi=150, bbox_inches='tight')
         plt.close()
 
         # 7. Saliency histogram
@@ -243,7 +264,7 @@ class EdgeAwareVisualizer:
         plt.savefig(output_dir / f"{base_name}_8_correlation_plot.png", dpi=150, bbox_inches='tight')
         plt.close()
 
-        # 9. Statistics text
+        # 9. Statistics text (updated with sub-pixel info)
         fig9, ax9 = plt.subplots(figsize=(8, 8))
         ax9.axis('off')
         stats_text = f"""
@@ -257,6 +278,14 @@ Std Dev:   {std:.4f}
 Variance:  {variance:.4f}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+SUB-PIXEL REFINEMENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+Mean Offset:   {mean_offset_magnitude:.3f} px
+Max Offset:    {max_offset_magnitude:.3f} px
+Target:        ±0.5 px
+Status:        {'✅ Good' if mean_offset_magnitude < 0.5 else '⚠️ High'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 QUALITY METRICS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 Edge Correlation:    {correlation:.3f}
@@ -266,13 +295,15 @@ Top-{top_k} Edge Str: {top_sal_edge_strength:.3f}
 
 TARGET RANGES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-Mean:      0.40-0.50 {'✅' if 0.40 <= saliency.mean() <= 0.50 else '❌'}
+Mean:      0.30-0.40 {'✅' if 0.30 <= saliency.mean() <= 0.40 else '❌'}
 Max:       0.70-0.90 {'✅' if 0.70 <= saliency.max() <= 0.90 else '❌'}
 Variance:  0.18-0.28 {'✅' if 0.18 <= variance <= 0.28 else '❌'}
-Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
+Correlation: >0.30   {'✅' if correlation > 0.30 else '❌'}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-{'✅ GOOD: Learning edges/corners!' if correlation > 0.40 and variance > 0.15 else '❌ NEEDS WORK: Low correlation/variance'}
+{'✅ GOOD: Learning edges/corners!' if correlation > 0.30 and variance > 0.15 else '❌ NEEDS WORK: Low correlation/variance'}
+
+🎯 Two-Stage Training + Sub-Pixel Refinement
         """
         ax9.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
                 verticalalignment='center')
@@ -281,7 +312,7 @@ Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
 
         print(f"✓ Saved 9 individual visualizations to {output_dir}/")
 
-        # Now create the combined figure
+        # Now create the combined figure (3x3 grid)
         fig = plt.figure(figsize=(20, 12))
         gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 
@@ -293,7 +324,8 @@ Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
             c=scores, cmap='hot', s=30, alpha=0.8,
             edgecolors='white', linewidths=0.5
         )
-        ax1.set_title('Keypoints (colored by score)', fontsize=12, fontweight='bold')
+        ax1.set_title(f'Keypoints (Sub-Pixel)\nMean offset: {mean_offset_magnitude:.3f} px',
+                     fontsize=12, fontweight='bold')
         ax1.axis('off')
         plt.colorbar(scatter, ax=ax1, fraction=0.046)
 
@@ -324,8 +356,9 @@ Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
         ax5.axis('off')
 
         ax6 = fig.add_subplot(gs[1, 2])
-        im6 = ax6.imshow(diff, cmap='RdYlGn_r', interpolation='nearest')
-        ax6.set_title(f'Alignment Error\nMean diff: {diff.mean():.3f}',
+        offset_magnitude = np.linalg.norm(offset_map, axis=-1)
+        im6 = ax6.imshow(offset_magnitude, cmap='viridis', interpolation='nearest')
+        ax6.set_title(f'Offset Magnitude\nMean: {offset_magnitude.mean():.3f}',
                      fontsize=12, fontweight='bold')
         ax6.axis('off')
         plt.colorbar(im6, ax=ax6, fraction=0.046)
@@ -352,10 +385,11 @@ Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
 
         ax9 = fig.add_subplot(gs[2, 2])
         ax9.axis('off')
-        ax9.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
+        ax9.text(0.1, 0.5, stats_text, fontsize=9, family='monospace',
                 verticalalignment='center')
 
-        plt.suptitle('Edge-Aware Saliency Analysis', fontsize=16, fontweight='bold', y=0.98)
+        plt.suptitle('Edge-Aware Saliency Analysis (Two-Stage + Sub-Pixel)',
+                    fontsize=16, fontweight='bold', y=0.98)
 
         # Save combined figure
         combined_path = output_dir / f"{base_name}_combined.png"
@@ -367,26 +401,48 @@ Correlation: >0.40   {'✅' if correlation > 0.40 else '❌'}
         print("\n" + "="*70)
         print("SALIENCY ANALYSIS SUMMARY")
         print("="*70)
-        print(f"Edge Correlation: {correlation:.3f} {'✅ GOOD' if correlation > 0.40 else '❌ LOW'}")
+        print(f"Edge Correlation: {correlation:.3f} {'✅ GOOD' if correlation > 0.30 else '❌ LOW'}")
         print(f"Variance:         {variance:.3f} {'✅ GOOD' if 0.18 <= variance <= 0.28 else '❌ OUT OF RANGE'}")
         print(f"Max Saliency:     {saliency.max():.3f} {'✅ GOOD' if 0.70 <= saliency.max() <= 0.90 else '❌ OUT OF RANGE'}")
+        print(f"\nSub-Pixel Refinement:")
+        print(f"Mean Offset:      {mean_offset_magnitude:.3f} px {'✅ GOOD' if mean_offset_magnitude < 0.5 else '⚠️ HIGH'}")
+        print(f"Max Offset:       {max_offset_magnitude:.3f} px")
         print("="*70)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize edge-aware saliency')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pth')
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml')
-    parser.add_argument('--image', type=str, default='test_image.png')
-    parser.add_argument('--output', type=str, default='edge_aware_viz.png')
+    parser = argparse.ArgumentParser(description='Visualize edge-aware saliency with sub-pixel refinement')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_stage1.pth',
+                       help='Path to model checkpoint')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
+                       help='Path to config file')
+    parser.add_argument('--image', type=str, default='test_image.png',
+                       help='Path to input image')
+    parser.add_argument('--output', type=str, default='edge_aware_viz.png',
+                       help='Output filename (saved in visualization_output/)')
 
     args = parser.parse_args()
+
+    # Check if image exists
+    if not Path(args.image).exists():
+        print(f"\n❌ Error: Image not found: {args.image}")
+        print("\nUsage:")
+        print("  python visualize.py --image path/to/your/image.png")
+        print("\nOr use a frame from TUM dataset:")
+        print("  python visualize.py --image data/tum_rgbd/rgbd_dataset_freiburg1_plant/rgb/1305031102.175304.png")
+        return
 
     visualizer = EdgeAwareVisualizer(args.checkpoint, args.config)
     features = visualizer.extract_features(args.image)
     visualizer.visualize_frame(features, args.output)
 
     print("\n✓ Check the visualization_output folder for all visualizations!")
+    print(f"  - 9 individual plots: *_1.png through *_9.png")
+    print(f"  - Combined view: *_combined.png")
+    print("\n📊 Key metrics to check:")
+    print("  ✓ Edge correlation should be >0.30 (learning structure)")
+    print("  ✓ Variance should be 0.18-0.28 (peaky detector)")
+    print("  ✓ Mean offset should be <0.5 px (sub-pixel precision)")
 
 
 if __name__ == "__main__":

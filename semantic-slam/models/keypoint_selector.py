@@ -1,9 +1,12 @@
 """
-FIXED Keypoint Selector - Actually Uses Saliency Properly!
-CRITICAL FIXES:
-1. Better thresholding (percentile-based, not absolute)
-2. Smart fallback (samples from high-saliency regions only)
-3. No uniform grid fallback (that was causing dark monitor selections)
+Keypoint Selector with Sub-Pixel Refinement (R2D2-style)
+
+Key improvements:
+1. Predicts sub-pixel offsets for accurate localization
+2. Percentile-based thresholding (no uniform fallback)
+3. Clean, focused implementation
+
+Reference: R2D2 (CVPR 2019), SuperPoint (CVPR 2018)
 """
 
 import torch
@@ -14,9 +17,11 @@ from typing import Tuple
 
 class KeypointSelector(nn.Module):
     """
-    Keypoint selector with PROPER saliency-based selection.
+    Learns to select stable keypoints with sub-pixel accuracy.
 
-    Key fix: Never falls back to uniform sampling!
+    Architecture:
+    - Saliency head: predicts per-patch importance scores
+    - Offset head: refines location within patch (R2D2 style)
     """
 
     def __init__(
@@ -26,67 +31,84 @@ class KeypointSelector(nn.Module):
     ):
         super().__init__()
 
-        # Simple 2-layer CNN
-        self.conv = nn.Sequential(
+        # Saliency prediction (which patches are interesting)
+        self.saliency_head = nn.Sequential(
             nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1),
         )
 
+        # Sub-pixel offset prediction (where exactly in the patch)
+        # Outputs (dx, dy) in range [-1, 1] (normalized to patch size)
+        self.offset_head = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 2, kernel_size=1),  # 2 channels: (dx, dy)
+            nn.Tanh()  # Bound to [-1, 1]
+        )
+
         self._init_weights()
 
     def _init_weights(self):
+        """Xavier initialization for stable training"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, dino_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Predict per-patch saliency scores.
+        Predict saliency and sub-pixel offsets.
 
         Args:
             dino_features: (B, H, W, C) in PATCH space
 
         Returns:
             saliency_map: (B, H, W, 1) scores in [0, 1]
+            offset_map: (B, H, W, 2) sub-pixel offsets in [-1, 1]
         """
-        # Convert to (B, C, H, W)
+        # Convert to (B, C, H, W) for conv layers
         x = dino_features.permute(0, 3, 1, 2)
 
-        # Predict logits
-        logits = self.conv(x)
+        # Predict saliency
+        saliency_logits = self.saliency_head(x)
+        saliency = torch.sigmoid(saliency_logits)
 
-        # Apply SIGMOID (not softmax!)
-        saliency = torch.sigmoid(logits)
+        # Predict offsets
+        offsets = self.offset_head(x)
 
-        # Convert back to (B, H, W, 1)
-        saliency_map = saliency.permute(0, 2, 3, 1)
+        # Convert back to (B, H, W, C) format
+        saliency_map = saliency.permute(0, 2, 3, 1)  # (B, H, W, 1)
+        offset_map = offsets.permute(0, 2, 3, 1)     # (B, H, W, 2)
 
-        return saliency_map
+        return saliency_map, offset_map
 
     def select_keypoints(
         self,
         saliency_map: torch.Tensor,
+        offset_map: torch.Tensor,
         num_keypoints: int = 500,
         nms_radius: int = 2,
-        min_score_percentile: float = 0.50  # NEW: Use top 50% of scores
+        min_score_percentile: float = 0.50
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Select keypoints using PERCENTILE-BASED thresholding.
+        Select keypoints with SUB-PIXEL accuracy.
 
-        CRITICAL FIX: Never uses uniform fallback!
-        Always selects from high-saliency regions.
+        Process:
+        1. NMS on saliency to find local maxima
+        2. Percentile-based thresholding (adaptive)
+        3. Refine locations with predicted offsets
 
         Args:
-            saliency_map: (B, H, W, 1) independent scores
+            saliency_map: (B, H, W, 1) saliency scores
+            offset_map: (B, H, W, 2) sub-pixel offsets
             num_keypoints: Target number of keypoints
-            nms_radius: NMS radius
-            min_score_percentile: Minimum percentile (0.5 = top 50%)
+            nms_radius: NMS radius in patches
+            min_score_percentile: Minimum score percentile (0.5 = top 50%)
 
         Returns:
-            keypoints: (B, N, 2) in PATCH coordinates
+            keypoints: (B, N, 2) in PATCH coordinates (with sub-pixel precision)
             scores: (B, N) saliency scores
         """
         B, H, W, _ = saliency_map.shape
@@ -99,104 +121,75 @@ class KeypointSelector(nn.Module):
 
         for b in range(B):
             sal_b = saliency[b]
+            offset_b = offset_map[b]  # (H, W, 2)
 
-            # STEP 1: Compute ADAPTIVE threshold (percentile-based)
-            # This ensures we always select from high-saliency regions!
+            # Step 1: Adaptive thresholding
             sal_flat = sal_b.flatten()
             threshold = torch.quantile(sal_flat, min_score_percentile)
+            threshold = max(threshold.item(), 0.1)  # Minimum safety threshold
 
-            # Ensure minimum threshold (avoid selecting noise)
-            threshold = max(threshold.item(), 0.1)
-
-            # STEP 2: Apply NMS
+            # Step 2: NMS
             sal_nms = self._apply_nms(sal_b.unsqueeze(0), nms_radius).squeeze(0)
 
-            # STEP 3: Threshold with adaptive value
+            # Step 3: Threshold
             valid_mask = sal_nms > threshold
-            valid_coords = torch.nonzero(valid_mask, as_tuple=False)
+            valid_coords = torch.nonzero(valid_mask, as_tuple=False)  # (M, 2) in (y, x)
             valid_scores = sal_nms[valid_mask]
 
-            # STEP 4: Select top-k by score
+            # Step 4: Select top-k
             if len(valid_scores) >= num_keypoints:
-                # Have enough candidates - select top-k
                 k = num_keypoints
                 top_scores, top_indices = torch.topk(valid_scores, k)
-                top_coords = valid_coords[top_indices]
-
-                # Convert to (x, y) format
-                kpts = torch.stack([top_coords[:, 1], top_coords[:, 0]], dim=1).float()
-                scrs = top_scores
-
-            elif len(valid_scores) > 0:
-                # Have some candidates - use all of them + sample more from lower threshold
-                existing_kpts = torch.stack([valid_coords[:, 1], valid_coords[:, 0]], dim=1).float()
-                existing_scrs = valid_scores
-
-                # Need more keypoints - lower threshold gradually
-                remaining = num_keypoints - len(valid_scores)
-
-                # Try progressively lower thresholds
+                top_coords = valid_coords[top_indices]  # (K, 2)
+            else:
+                # Not enough candidates - lower threshold iteratively
                 for percentile in [0.40, 0.30, 0.20, 0.10]:
                     lower_threshold = torch.quantile(sal_flat, percentile)
-                    lower_threshold = max(lower_threshold.item(), 0.05)
+                    lower_mask = sal_nms > max(lower_threshold.item(), 0.05)
+                    lower_coords = torch.nonzero(lower_mask, as_tuple=False)
+                    lower_scores = sal_nms[lower_mask]
 
-                    additional_mask = (sal_nms > lower_threshold) & (~valid_mask)
-                    additional_coords = torch.nonzero(additional_mask, as_tuple=False)
-                    additional_scores = sal_nms[additional_mask]
-
-                    if len(additional_scores) >= remaining:
-                        top_scores, top_indices = torch.topk(additional_scores, remaining)
-                        top_coords = additional_coords[top_indices]
-
-                        add_kpts = torch.stack([top_coords[:, 1], top_coords[:, 0]], dim=1).float()
-                        add_scrs = top_scores
-
-                        kpts = torch.cat([existing_kpts, add_kpts], dim=0)
-                        scrs = torch.cat([existing_scrs, add_scrs], dim=0)
+                    if len(lower_scores) >= num_keypoints:
+                        top_scores, top_indices = torch.topk(lower_scores, num_keypoints)
+                        top_coords = lower_coords[top_indices]
                         break
                 else:
-                    # Use what we have
-                    kpts = existing_kpts
-                    scrs = existing_scrs
+                    # Last resort: use all available
+                    top_coords = valid_coords
+                    top_scores = valid_scores
 
-                    # Pad with highest remaining scores
-                    if len(kpts) < num_keypoints:
-                        all_scores = sal_b.flatten()
-                        remaining = num_keypoints - len(kpts)
-                        top_remaining, top_idx = torch.topk(all_scores, remaining)
+                    # Pad if needed
+                    if len(top_coords) < num_keypoints:
+                        # Duplicate highest score point
+                        pad_size = num_keypoints - len(top_coords)
+                        best_idx = top_scores.argmax()
+                        pad_coords = top_coords[best_idx:best_idx+1].repeat(pad_size, 1)
+                        pad_scores = top_scores[best_idx:best_idx+1].repeat(pad_size)
 
-                        y_coords = top_idx // W
-                        x_coords = top_idx % W
-                        add_kpts = torch.stack([x_coords, y_coords], dim=1).float()
+                        top_coords = torch.cat([top_coords, pad_coords], dim=0)
+                        top_scores = torch.cat([top_scores, pad_scores], dim=0)
 
-                        kpts = torch.cat([kpts, add_kpts], dim=0)
-                        scrs = torch.cat([scrs, top_remaining], dim=0)
-            else:
-                # LAST RESORT: No valid candidates above threshold
-                # Select top-k from raw saliency (but still from high scores!)
-                sal_flat = sal_b.flatten()
-                top_scores, top_indices = torch.topk(sal_flat, num_keypoints)
+            # Step 5: SUB-PIXEL REFINEMENT (R2D2 style)
+            y_coords = top_coords[:, 0]  # (K,)
+            x_coords = top_coords[:, 1]  # (K,)
 
-                y_coords = top_indices // W
-                x_coords = top_indices % W
+            # Get offsets at these integer locations
+            offsets_at_kpts = offset_b[y_coords, x_coords]  # (K, 2) in (dx, dy)
 
-                kpts = torch.stack([x_coords, y_coords], dim=1).float()
-                scrs = top_scores
+            # FIXED: Clamp offsets first to prevent saturation
+            offsets_at_kpts = torch.clamp(offsets_at_kpts, -1.0, 1.0)
 
-            # Ensure exactly num_keypoints
-            if len(kpts) > num_keypoints:
-                kpts = kpts[:num_keypoints]
-                scrs = scrs[:num_keypoints]
-            elif len(kpts) < num_keypoints:
-                # Pad with duplicates of highest score point
-                pad_size = num_keypoints - len(kpts)
-                best_idx = scrs.argmax()
+            # Refine: integer coords + fractional offsets
+            # Offsets are in [-1, 1], scale to [-0.5, 0.5] for sub-pixel precision
+            x_refined = x_coords.float() + 0.5 * offsets_at_kpts[:, 0]
+            y_refined = y_coords.float() + 0.5 * offsets_at_kpts[:, 1]
 
-                pad_kpts = kpts[best_idx:best_idx+1].repeat(pad_size, 1)
-                pad_scrs = scrs[best_idx:best_idx+1].repeat(pad_size)
+            # Clamp to valid range
+            x_refined = torch.clamp(x_refined, 0, W - 1)
+            y_refined = torch.clamp(y_refined, 0, H - 1)
 
-                kpts = torch.cat([kpts, pad_kpts], dim=0)
-                scrs = torch.cat([scrs, pad_scrs], dim=0)
+            kpts = torch.stack([x_refined, y_refined], dim=1)  # (K, 2) in (x, y)
+            scrs = top_scores
 
             keypoints_list.append(kpts)
             scores_list.append(scrs)

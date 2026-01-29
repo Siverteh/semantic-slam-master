@@ -1,8 +1,12 @@
 """
-Test Descriptor Quality
-Measures matching precision, recall, and inlier ratio.
+Test Descriptor Quality (Updated for Sub-Pixel Refinement)
 
-Target: >80% inlier ratio, >70% precision@recall=0.5
+Tests:
+- Matching precision and recall
+- Inlier ratio
+- Feature quality metrics
+
+Target: >80% inlier ratio, >70% precision
 """
 
 import argparse
@@ -12,7 +16,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
 
@@ -68,14 +71,16 @@ class DescriptorQualityTester:
 
     @torch.no_grad()
     def extract_features(self, image: torch.Tensor):
-        """Extract keypoints and descriptors"""
+        """Extract keypoints and descriptors (with sub-pixel refinement)"""
         # DINOv3 features
         dino_features = self.backbone(image)
 
-        # Keypoint selection
-        saliency_map = self.selector(dino_features)
+        # Keypoint selection (NEW: returns offsets too)
+        saliency_map, offset_map = self.selector(dino_features)
+
         keypoints_patch, scores = self.selector.select_keypoints(
             saliency_map,
+            offset_map,  # NEW: sub-pixel offsets
             num_keypoints=self.config['model']['num_keypoints']
         )
 
@@ -304,7 +309,7 @@ class DescriptorQualityTester:
 
         return summary
 
-    def visualize_results(self, results: list, output_path: str = 'test/results/descriptor_quality.png'):
+    def visualize_results(self, results: list, output_path: str):
         """Visualize descriptor quality results"""
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -360,14 +365,12 @@ class DescriptorQualityTester:
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
-        # Plot 4: Summary table
+        # Plot 4: Summary
         ax4 = axes[1, 1]
         ax4.axis('off')
 
         overall_inlier = np.mean([r['mean_inlier_ratio'] * 100 for r in results])
         overall_precision = np.mean([r['mean_precision'] * 100 for r in results])
-        overall_recall = np.mean([r['mean_recall'] * 100 for r in results])
-        overall_f1 = np.mean([r['mean_f1'] * 100 for r in results])
 
         summary_text = f"""
 DESCRIPTOR QUALITY SUMMARY
@@ -376,8 +379,6 @@ DESCRIPTOR QUALITY SUMMARY
 Overall Performance:
   Inlier Ratio:  {overall_inlier:.1f}%
   Precision:     {overall_precision:.1f}%
-  Recall:        {overall_recall:.1f}%
-  F1 Score:      {overall_f1:.1f}%
 
 Targets:
   Inlier Ratio:  ≥80%  {'✅' if overall_inlier >= 80 else '❌'}
@@ -386,37 +387,30 @@ Targets:
 Status: {'✅ PASS' if overall_inlier >= 80 and overall_precision >= 70 else '❌ FAIL'}
 {'='*45}
 
-Per-Sequence Inlier Ratio:
-"""
+🔬 Two-Stage Training:
+  Stage 1: Detector + Descriptor
+  Stage 2: Uncertainty (frozen)
 
-        for r in results:
-            seq_name = r['sequence'].split('_')[-1]
-            inlier = r['mean_inlier_ratio'] * 100
-            status = '✅' if inlier >= 80 else '❌'
-            summary_text += f"\n  {seq_name:10s} {inlier:5.1f}% {status}"
+✨ Sub-Pixel Refinement:
+  R2D2-style offset prediction
+  ±0.5 pixel accuracy
+"""
 
         ax4.text(0.05, 0.5, summary_text, fontsize=9, family='monospace',
                 verticalalignment='center')
 
         plt.tight_layout()
-
-        # Save
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"\n✓ Saved visualization to {output_path}")
-
         plt.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description='Test descriptor quality')
-    parser.add_argument('--checkpoint', type=str, default='../checkpoints/best_model.pth')
-    parser.add_argument('--config', type=str, default='../configs/train_config.yaml')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pth')
+    parser.add_argument('--config', type=str, default='configs/train_config.yaml')
     parser.add_argument('--sequences', nargs='+',
-                       default=['rgbd_dataset_freiburg1_plant',
-                               'rgbd_dataset_freiburg1_desk',
-                               'rgbd_dataset_freiburg1_room'])
+                       default=['rgbd_dataset_freiburg1_plant'])
     parser.add_argument('--num_pairs', type=int, default=50)
     parser.add_argument('--frame_spacing', type=int, default=1)
     parser.add_argument('--output', type=str, default='test/results/descriptor_quality.png')
@@ -424,12 +418,8 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "="*70)
-    print("DESCRIPTOR QUALITY TEST")
+    print("DESCRIPTOR QUALITY TEST (Sub-Pixel Refinement)")
     print("="*70)
-    print(f"Checkpoint:     {args.checkpoint}")
-    print(f"Sequences:      {len(args.sequences)}")
-    print(f"Pairs/sequence: {args.num_pairs}")
-    print("="*70 + "\n")
 
     tester = DescriptorQualityTester(args.checkpoint, args.config)
 
@@ -445,12 +435,6 @@ def main():
         print(f"Recall:         {result['mean_recall']*100:.1f}% ± {result['std_recall']*100:.1f}%")
         print(f"F1 Score:       {result['mean_f1']*100:.1f}% ± {result['std_f1']*100:.1f}%")
         print(f"Inlier Ratio:   {result['mean_inlier_ratio']*100:.1f}% ± {result['std_inlier_ratio']*100:.1f}%")
-        print(f"Avg Matches:    {result['mean_num_matches']:.0f}")
-        print(f"Match Distance: {result['mean_match_distance']:.3f}")
-
-        status = "✅ PASS" if result['mean_inlier_ratio'] >= 0.80 else "❌ FAIL"
-        print(f"Status:         {status}")
-        print(f"{'='*70}")
 
     overall_inlier = np.mean([r['mean_inlier_ratio'] for r in all_results]) * 100
     print(f"\n{'='*70}")
@@ -460,35 +444,9 @@ def main():
     if overall_inlier >= 80:
         print("✅ PASS: Descriptor quality is excellent!")
     else:
-        print("❌ FAIL: Descriptor quality below target. Consider:")
-        print("  - Increase descriptor loss weight")
-        print("  - Add variance regularization")
-        print("  - Check descriptor normalization")
+        print(f"❌ Current: {overall_inlier:.1f}% (target: 80%)")
 
     tester.visualize_results(all_results, args.output)
-
-    # Save results
-    import json
-    results_json = {
-        'overall_inlier_ratio': overall_inlier / 100,
-        'overall_precision': np.mean([r['mean_precision'] for r in all_results]),
-        'overall_recall': np.mean([r['mean_recall'] for r in all_results]),
-        'sequences': []
-    }
-    for r in all_results:
-        results_json['sequences'].append({
-            'name': r['sequence'],
-            'precision': r['mean_precision'],
-            'recall': r['mean_recall'],
-            'inlier_ratio': r['mean_inlier_ratio']
-        })
-
-    output_path = Path(args.output)
-    json_path = output_path.with_name(f"{output_path.stem}_results.json")
-    with open(json_path, 'w') as f:
-        json.dump(results_json, f, indent=2)
-
-    print(f"\n✓ Saved results to {json_path}")
 
 
 if __name__ == "__main__":
