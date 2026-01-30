@@ -1,6 +1,6 @@
 """
 TUM RGB-D Dataset Loader
-FIXED: Added data augmentation for better generalization
+FIXED: Added random frame spacing for better generalization
 """
 
 import os
@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Union, List
 import torchvision.transforms as transforms
 import random
 
@@ -25,7 +25,7 @@ class TUMDataset(Dataset):
         dataset_root: str,
         sequence: str,
         input_size: int = 448,
-        frame_spacing: int = 1,
+        frame_spacing: Union[int, List[int]] = 1,  # NOW SUPPORTS LIST!
         max_frames: Optional[int] = None,
         augmentation: Optional[dict] = None,
         is_train: bool = True
@@ -35,7 +35,8 @@ class TUMDataset(Dataset):
             dataset_root: Path to TUM RGB-D dataset root
             sequence: Sequence name
             input_size: Image size for DINOv3
-            frame_spacing: Spacing between consecutive frames
+            frame_spacing: Spacing between frames - can be int or list of ints
+                          If list, randomly samples spacing for each pair (training only)
             max_frames: Maximum frames to use
             augmentation: Dict with augmentation params (only applied if is_train=True)
             is_train: Whether this is training (apply augmentation) or validation
@@ -48,15 +49,23 @@ class TUMDataset(Dataset):
         self.dataset_root = dataset_root_path
         self.sequence = sequence
         self.input_size = input_size
-        self.frame_spacing = frame_spacing
         self.is_train = is_train
+
+        # UPDATED: Support for random frame spacing
+        if isinstance(frame_spacing, list):
+            self.frame_spacing_list = frame_spacing
+            self.use_random_spacing = is_train  # Only random during training
+            self.max_spacing = max(frame_spacing)
+        else:
+            self.frame_spacing_list = [frame_spacing]
+            self.use_random_spacing = False
+            self.max_spacing = frame_spacing
 
         # Paths
         candidate_sequence_dir = self.dataset_root / sequence
         if candidate_sequence_dir.exists():
             self.sequence_dir = candidate_sequence_dir
         else:
-            # Allow dataset_root to point directly to a sequence directory
             self.sequence_dir = self.dataset_root
         self.rgb_dir = self.sequence_dir / "rgb"
         self.depth_dir = self.sequence_dir / "depth"
@@ -94,7 +103,7 @@ class TUMDataset(Dataset):
             )
         ])
 
-        # Augmentation transforms (following R2D2/SuperPoint)
+        # Augmentation transforms
         self.augmentation = augmentation if (augmentation and is_train) else None
         if self.augmentation and self.augmentation.get('enabled', False):
             self.color_jitter = transforms.ColorJitter(
@@ -111,21 +120,35 @@ class TUMDataset(Dataset):
             transforms.ToTensor()
         ])
 
+        spacing_str = str(self.frame_spacing_list) if self.use_random_spacing else str(self.max_spacing)
         print(f"Loaded TUM sequence: {sequence}")
         print(f"  Frames: {len(self.rgb_files)}")
         print(f"  Input size: {input_size}x{input_size}")
-        print(f"  Frame spacing: {frame_spacing}")
+        print(f"  Frame spacing: {spacing_str} {'(random)' if self.use_random_spacing else ''}")
         print(f"  Augmentation: {'enabled' if self.augmentation else 'disabled'}")
 
     def __len__(self) -> int:
-        return max(0, len(self.rgb_files) - self.frame_spacing)
+        # Use max spacing to ensure we have enough frames
+        return max(0, len(self.rgb_files) - self.max_spacing)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Returns a pair of consecutive frames with metadata.
+        Returns a pair of frames with metadata.
+        UPDATED: Randomly samples spacing during training if list provided.
         """
         idx1 = idx
-        idx2 = idx + self.frame_spacing
+
+        # UPDATED: Random spacing during training
+        if self.use_random_spacing:
+            spacing = random.choice(self.frame_spacing_list)
+        else:
+            spacing = self.frame_spacing_list[0]
+
+        idx2 = idx + spacing
+
+        # Ensure idx2 is valid
+        if idx2 >= len(self.rgb_files):
+            idx2 = len(self.rgb_files) - 1
 
         # Load RGB images
         rgb1 = Image.open(self.rgb_dir / self.rgb_files[idx1]).convert("RGB")
@@ -179,7 +202,8 @@ class TUMDataset(Dataset):
             'depth1': depth1_tensor,
             'depth2': depth2_tensor,
             'timestamp1': self.timestamps[idx1],
-            'timestamp2': self.timestamps[idx2]
+            'timestamp2': self.timestamps[idx2],
+            'frame_spacing': spacing  # NEW: Include actual spacing used
         }
 
         # Add poses if available

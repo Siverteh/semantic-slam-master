@@ -52,6 +52,8 @@ from losses.self_supervised import (
 )
 
 
+print("GPU AVAILABLE:", torch.cuda.is_available())
+
 class SemanticSLAMTrainer:
     """
     SOTA 2025 Trainer for Semantic Keypoint Detection.

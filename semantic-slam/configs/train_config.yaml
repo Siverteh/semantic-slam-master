@@ -1,45 +1,38 @@
 # SOTA 2025 Training Configuration for Semantic Keypoint Detection
-# Based on DeDoDe v2, ALIKE, DINO-VO, XFeat, and Keypt2Subpx (2024-2025)
-#
-# Key changes from previous version:
-# - EXACTLY 4 losses (no more!)
-# - Sub-pixel offset prediction enabled
-# - Single-stage joint training
-# - 40 epochs (DeDoDe v2 shows shorter training is better)
+# FIXED: Now trains on varied frame spacings for better generalization
 
 # Model architecture
 model:
   backbone: "vit_small_patch16_dinov3.lvd1689m"
-  input_size: 448           # 448x448 images -> 28x28 grid
-  num_keypoints: 500        # Top-K keypoints per frame
-
-  # Keypoint Selector (with sub-pixel offset head)
-  selector_hidden: 128      # Hidden dim for both saliency and offset heads
-
-  # Descriptor Refiner (4-layer MLP with residuals)
-  descriptor_dim: 128       # Final descriptor dimension (L2-normalized)
-  refiner_hidden: 384       # Hidden dimension (same as DINOv3)
-  refiner_layers: 4         # Number of layers (including residual blocks)
+  input_size: 448
+  num_keypoints: 500
+  selector_hidden: 128
+  descriptor_dim: 128
+  refiner_hidden: 384
+  refiner_layers: 4
 
 # Dataset configuration
 dataset:
   root: "data/tum_rgbd"
 
-  # Training sequences (mix of easy/medium/hard)
+  # Training sequences
   train_sequences:
-    - "rgbd_dataset_freiburg1_desk"            # Easy: Static office
-    - "rgbd_dataset_freiburg1_room"            # Medium: Room with varied textures
-    - "rgbd_dataset_freiburg3_walking_static"  # Challenge: Dynamic person
+    - "rgbd_dataset_freiburg1_desk"
+    - "rgbd_dataset_freiburg1_room"
+    - "rgbd_dataset_freiburg3_walking_static"
 
   # Validation sequences
   val_sequences:
-    - "rgbd_dataset_freiburg1_plant"           # Hard: Low texture
+    - "rgbd_dataset_freiburg1_plant"
 
-  # Frame spacing: random [1, 2, 3, 5] for temporal robustness
-  frame_spacing: 1
-  max_frames: null  # Use all frames
+  # CRITICAL FIX: Random frame spacing [1, 2, 3, 5]
+  # This ensures model learns to match frames with varying motion
+  # Training randomly samples from this list each batch
+  frame_spacing: [1, 2, 3, 5]  # CHANGED FROM: 1
 
-  # Data augmentation (as specified)
+  max_frames: null
+
+  # Data augmentation
   augmentation:
     enabled: true
     brightness: 0.2
@@ -49,47 +42,40 @@ dataset:
     gaussian_blur: 0.3
 
 # Loss configuration - EXACTLY 4 LOSSES
-# Total loss = 10.0*descriptor + 1.0*homographic + 5.0*peakiness + 0.15*offset
 loss:
   weights:
-    descriptor: 10.0       # Dominant - learn discriminative descriptors
-    homographic: 1.0       # Spatial entropy - spread keypoints
-    peakiness: 5.0         # Variance + sparsity + window variance
-    offset: 0.15           # Sub-pixel offset consistency
+    descriptor: 10.0
+    homographic: 1.0
+    peakiness: 5.0
+    offset: 0.15
 
   # Descriptor loss parameters
-  temperature: 0.07        # InfoNCE temperature (lower = harder negatives)
+  temperature: 0.07
 
   # Peakiness loss parameters
-  target_variance: 0.22    # Target saliency variance
-  target_mean: 0.30        # Target mean activation (30% of pixels)
+  target_variance: 0.22
+  target_mean: 0.30
 
   # Offset loss parameters
-  max_offset: 0.3          # Maximum allowed offset magnitude
+  max_offset: 0.3
 
 # Training configuration
 training:
-  epochs: 40               # DeDoDe v2 shows shorter training is better
-  batch_size: 4            # Limited by GPU memory with DINOv3
-  lr: 1.0e-4               # Learning rate
-  lr_min: 1.0e-6           # Minimum LR for cosine annealing
-  weight_decay: 1.0e-4     # AdamW weight decay
-  grad_clip: 1.0           # Gradient clipping max norm
-  num_workers: 4           # DataLoader workers
+  epochs: 40
+  batch_size: 4
+  lr: 1.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  num_workers: 4
 
   # Validation and checkpointing
-  val_interval: 1          # Validate every epoch
-  save_interval: 5         # Save checkpoint every N epochs
+  val_interval: 1
+  save_interval: 5
   save_dir: "checkpoints"
 
 # Logging configuration
 logging:
   use_wandb: false
   project: "semantic-slam-thesis"
-  run_name: "sota-2025-subpixel-v1"
-
-# Expected performance targets (for reference)
-# - Repeatability: >70% at 3-pixel threshold
-# - Descriptor inlier ratio: >80% for good matches
-# - Mean offset magnitude: <0.5 pixels (sub-pixel accuracy)
-# - Saliency variance: 0.15-0.30 (learning structure)
+  run_name: "sota-2025-varied-spacing-v1"  # UPDATED name
