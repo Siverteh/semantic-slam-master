@@ -10,13 +10,38 @@ import cv2
 import numpy as np
 from pathlib import Path
 import sys
+import os
 
 # Add semantic-slam to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'semantic-slam'))
+semantic_slam_env = os.environ.get("SEMANTIC_SLAM_DIR", "").strip()
+if semantic_slam_env:
+    semantic_slam_dir = Path(semantic_slam_env)
+else:
+    semantic_slam_dir = Path(__file__).parent.parent / "semantic-slam"
+semantic_slam_dir = semantic_slam_dir.resolve()
+if semantic_slam_dir.exists():
+    sys.path.insert(0, str(semantic_slam_dir))
 
-from models.dino_backbone import DinoBackbone
-from models.keypoint_selector import KeypointSelector
-from models.descriptor_refiner import DescriptorRefiner
+try:
+    from models.dino_backbone import DinoBackbone
+    from models.keypoint_selector import KeypointSelector
+    from models.descriptor_refiner import DescriptorRefiner
+except ModuleNotFoundError:
+    import importlib.util
+
+    models_dir = semantic_slam_dir / "models"
+
+    def _load_class(module_file: Path, class_name: str):
+        if not module_file.exists():
+            raise ModuleNotFoundError(f"Missing module file: {module_file}")
+        spec = importlib.util.spec_from_file_location(module_file.stem, str(module_file))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, class_name)
+
+    DinoBackbone = _load_class(models_dir / "dino_backbone.py", "DinoBackbone")
+    KeypointSelector = _load_class(models_dir / "keypoint_selector.py", "KeypointSelector")
+    DescriptorRefiner = _load_class(models_dir / "descriptor_refiner.py", "DescriptorRefiner")
 
 
 class SemanticFeatureExtractor:
@@ -28,8 +53,8 @@ class SemanticFeatureExtractor:
     def __init__(
         self,
         checkpoint_path: str,
-        device: str = 'cuda',
-        num_keypoints: int = 500
+        device: str = "cuda",
+        num_keypoints: int = 500,
     ):
         """
         Args:
@@ -37,39 +62,39 @@ class SemanticFeatureExtractor:
             device: 'cuda' or 'cpu'
             num_keypoints: Number of keypoints to extract (default: 500)
         """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.num_keypoints = num_keypoints
 
-        print(f"Loading semantic feature extractor...")
+        print("Loading semantic feature extractor...")
         print(f"  Device: {self.device}")
         print(f"  Checkpoint: {checkpoint_path}")
 
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        config = checkpoint['config']
+        config = checkpoint["config"]
 
         # Initialize models
         self.backbone = DinoBackbone(
-            model_name=config['model']['backbone'],
-            input_size=config['model']['input_size'],
-            freeze=True
+            model_name=config["model"]["backbone"],
+            input_size=config["model"]["input_size"],
+            freeze=True,
         ).to(self.device)
 
         self.selector = KeypointSelector(
             input_dim=self.backbone.embed_dim,
-            hidden_dim=config['model']['selector_hidden']
+            hidden_dim=config["model"]["selector_hidden"],
         ).to(self.device)
 
         self.refiner = DescriptorRefiner(
             input_dim=self.backbone.embed_dim,
-            hidden_dim=config['model']['refiner_hidden'],
-            output_dim=config['model']['descriptor_dim'],
-            num_layers=config['model']['refiner_layers']
+            hidden_dim=config["model"]["refiner_hidden"],
+            output_dim=config["model"]["descriptor_dim"],
+            num_layers=config["model"]["refiner_layers"],
         ).to(self.device)
 
         # Load trained weights
-        self.selector.load_state_dict(checkpoint['selector_state_dict'])
-        self.refiner.load_state_dict(checkpoint['refiner_state_dict'])
+        self.selector.load_state_dict(checkpoint["selector_state_dict"])
+        self.refiner.load_state_dict(checkpoint["refiner_state_dict"])
 
         # Set to eval mode
         self.backbone.eval()
@@ -77,11 +102,11 @@ class SemanticFeatureExtractor:
         self.refiner.eval()
 
         # Image preprocessing (same as training)
-        self.input_size = config['model']['input_size']
+        self.input_size = config["model"]["input_size"]
         self.mean = np.array([0.485, 0.456, 0.406])
         self.std = np.array([0.229, 0.224, 0.225])
 
-        print(f"  ✓ Model loaded successfully")
+        print("  ✓ Model loaded successfully")
         print(f"  ✓ Input size: {self.input_size}x{self.input_size}")
         print(f"  ✓ Descriptor dim: {config['model']['descriptor_dim']}")
         print(f"  ✓ Target keypoints: {num_keypoints}")
@@ -148,10 +173,10 @@ class SemanticFeatureExtractor:
                 x=float(pixel_coords[i, 0]),
                 y=float(pixel_coords[i, 1]),
                 size=20.0,  # Fixed size (doesn't matter for matching)
-                angle=-1,   # No orientation
+                angle=-1,  # No orientation
                 response=float(scores[i]),
                 octave=0,
-                class_id=-1
+                class_id=-1,
             )
             cv_keypoints.append(kp)
 
@@ -172,9 +197,7 @@ class SemanticFeatureExtractor:
 
         # Resize to input size
         image_resized = cv2.resize(
-            image_rgb,
-            (self.input_size, self.input_size),
-            interpolation=cv2.INTER_LINEAR
+            image_rgb, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR
         )
 
         # Normalize to [0, 1]
@@ -209,7 +232,7 @@ class SemanticFeatureExtractor:
         # For simplicity, just run full detectAndCompute
         # In practice, you'd extract features at specific locations
         _, descriptors = self.detectAndCompute(image)
-        return descriptors[:len(keypoints)]
+        return descriptors[: len(keypoints)]
 
 
 def test_feature_extractor(checkpoint_path: str, test_image_path: str):
@@ -220,9 +243,9 @@ def test_feature_extractor(checkpoint_path: str, test_image_path: str):
         checkpoint_path: Path to trained checkpoint
         test_image_path: Path to test image
     """
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("TESTING SEMANTIC FEATURE EXTRACTOR")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     # Load extractor
     extractor = SemanticFeatureExtractor(checkpoint_path)
@@ -239,11 +262,12 @@ def test_feature_extractor(checkpoint_path: str, test_image_path: str):
     # Extract features
     print("\nExtracting features...")
     import time
+
     start = time.time()
     keypoints, descriptors = extractor.detectAndCompute(image)
     elapsed = time.time() - start
 
-    print(f"\n✓ Extraction complete!")
+    print("\n✓ Extraction complete!")
     print(f"  Time: {elapsed*1000:.1f} ms ({1/elapsed:.1f} FPS)")
     print(f"  Keypoints: {len(keypoints)}")
     print(f"  Descriptor shape: {descriptors.shape}")
@@ -252,24 +276,7 @@ def test_feature_extractor(checkpoint_path: str, test_image_path: str):
     # Visualize keypoints
     output_path = "test_keypoints.png"
     vis_image = cv2.drawKeypoints(
-        image, keypoints, None,
-        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+        image, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
     )
     cv2.imwrite(output_path, vis_image)
-    print(f"\n✓ Visualization saved: {output_path}")
-
-    print("\n" + "="*70)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Test semantic feature extractor')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                       help='Path to trained checkpoint')
-    parser.add_argument('--image', type=str, required=True,
-                       help='Path to test image')
-
-    args = parser.parse_args()
-
-    test_feature_extractor(args.checkpoint, args.image)
+    print(f"\n✓ Visualization saved: {output_path}\n")
