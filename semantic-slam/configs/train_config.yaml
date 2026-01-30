@@ -1,45 +1,45 @@
-# Training Configuration with Proper Train/Val/Test Split
-# NO OVERLAP between train/val/test!
+# SOTA 2025 Training Configuration for Semantic Keypoint Detection
+# Based on DeDoDe v2, ALIKE, DINO-VO, XFeat, and Keypt2Subpx (2024-2025)
+#
+# Key changes from previous version:
+# - EXACTLY 4 losses (no more!)
+# - Sub-pixel offset prediction enabled
+# - Single-stage joint training
+# - 40 epochs (DeDoDe v2 shows shorter training is better)
 
 # Model architecture
 model:
   backbone: "vit_small_patch16_dinov3.lvd1689m"
-  input_size: 448
-  num_keypoints: 500
+  input_size: 448           # 448x448 images -> 28x28 grid
+  num_keypoints: 500        # Top-K keypoints per frame
 
-  selector_hidden: 256
-  selector_layers: 3
+  # Keypoint Selector (with sub-pixel offset head)
+  selector_hidden: 128      # Hidden dim for both saliency and offset heads
 
-  descriptor_dim: 128
-  refiner_hidden: 384  # Increased capacity
-  refiner_layers: 4
+  # Descriptor Refiner (4-layer MLP with residuals)
+  descriptor_dim: 128       # Final descriptor dimension (L2-normalized)
+  refiner_hidden: 384       # Hidden dimension (same as DINOv3)
+  refiner_layers: 4         # Number of layers (including residual blocks)
 
-  estimator_hidden: 128
-
-# Dataset configuration - PROPER SPLIT!
+# Dataset configuration
 dataset:
   root: "data/tum_rgbd"
 
-  # TRAINING: 3 sequences (mix of easy/medium, static)
+  # Training sequences (mix of easy/medium/hard)
   train_sequences:
-    - "rgbd_dataset_freiburg1_desk"   # Easy: Static office, lots of texture
-    - "rgbd_dataset_freiburg1_room"   # Medium: Room with varied textures
-    - "rgbd_dataset_freiburg3_walking_static"  # Challenge: Dynamic person (fr3 sensor)
+    - "rgbd_dataset_freiburg1_desk"            # Easy: Static office
+    - "rgbd_dataset_freiburg1_room"            # Medium: Room with varied textures
+    - "rgbd_dataset_freiburg3_walking_static"  # Challenge: Dynamic person
 
-  # VALIDATION: 1 sequence (main challenge case)
+  # Validation sequences
   val_sequences:
-    - "rgbd_dataset_freiburg1_plant"  # Hard: Low texture (classic SLAM challenge)
+    - "rgbd_dataset_freiburg1_plant"           # Hard: Low texture
 
-  # TEST (for final evaluation only): 2 sequences - NEVER SEEN DURING TRAINING!
-  # Note: These should ONLY be used in test scripts, not during training
-  test_sequences:
-    - "rgbd_dataset_freiburg3_long_office_household"  # Long sequence, drift test
-    - "rgbd_dataset_freiburg3_walking_xyz"  # Dynamic + structured motion
-
+  # Frame spacing: random [1, 2, 3, 5] for temporal robustness
   frame_spacing: 1
-  max_frames: null
+  max_frames: null  # Use all frames
 
-  # Data augmentation
+  # Data augmentation (as specified)
   augmentation:
     enabled: true
     brightness: 0.2
@@ -48,74 +48,48 @@ dataset:
     saturation: 0.2
     gaussian_blur: 0.3
 
-# Loss configuration - CORRECT APPROACH!
+# Loss configuration - EXACTLY 4 LOSSES
+# Total loss = 10.0*descriptor + 1.0*homographic + 5.0*peakiness + 0.15*offset
 loss:
   weights:
-    desc: 8.0        # Strong descriptor learning (dominant)
-    repeat: 0.3
-    variance: 0.5    # Prevent collapse
-    peakiness: 0.1
-    activation: 0.05
-    edge: 0.3        # REDUCED from 0.8! (was too dominant)
-    sparsity: 0.3
+    descriptor: 10.0       # Dominant - learn discriminative descriptors
+    homographic: 1.0       # Spatial entropy - spread keypoints
+    peakiness: 5.0         # Variance + sparsity + window variance
+    offset: 0.15           # Sub-pixel offset consistency
 
-  # Descriptor loss (InfoNCE)
-  desc_temperature: 0.10  # Slightly higher for stability
-  desc_negatives: 40
+  # Descriptor loss parameters
+  temperature: 0.07        # InfoNCE temperature (lower = harder negatives)
 
-  # Repeatability loss
-  repeat_threshold: 2.0
+  # Peakiness loss parameters
+  target_variance: 0.22    # Target saliency variance
+  target_mean: 0.30        # Target mean activation (30% of pixels)
 
-  # Peakiness loss
-  target_variance: 0.22
-
-  # Activation loss
-  sparsity_target: 0.35
-
-  # Edge awareness loss
-  edge_threshold: 0.1
-
-  # Spatial sparsity loss
-  sparsity_penalty: 2.0
+  # Offset loss parameters
+  max_offset: 0.3          # Maximum allowed offset magnitude
 
 # Training configuration
 training:
-  epochs: 60
-  batch_size: 4
-  lr: 1e-4
-  lr_min: 1e-6
-  weight_decay: 1e-4
-  grad_clip: 1.0
-  num_workers: 4
-  warmup_epochs: 3
+  epochs: 40               # DeDoDe v2 shows shorter training is better
+  batch_size: 4            # Limited by GPU memory with DINOv3
+  lr: 1.0e-4               # Learning rate
+  lr_min: 1.0e-6           # Minimum LR for cosine annealing
+  weight_decay: 1.0e-4     # AdamW weight decay
+  grad_clip: 1.0           # Gradient clipping max norm
+  num_workers: 4           # DataLoader workers
 
-  val_interval: 1
-  save_interval: 5
+  # Validation and checkpointing
+  val_interval: 1          # Validate every epoch
+  save_interval: 5         # Save checkpoint every N epochs
   save_dir: "checkpoints"
 
 # Logging configuration
 logging:
-  use_wandb: true
+  use_wandb: false
   project: "semantic-slam-thesis"
-  run_name: "proper-split-fixed-edge-v1"
-  log_interval: 50
+  run_name: "sota-2025-subpixel-v1"
 
-# Dataset rationale (for your thesis documentation):
-#
-# TRAINING (3 sequences):
-#   - fr1_desk: Baseline static scene with good texture
-#   - fr1_room: More complex indoor environment
-#   - fr3_walking_static: Introduces dynamic objects + fr3 sensor diversity
-#
-# VALIDATION (1 sequence):
-#   - fr1_plant: Low-texture challenge (standard SLAM benchmark)
-#
-# TEST (2 sequences - use ONLY for final evaluation):
-#   - fr3_long_office_household: Tests long-term stability and drift
-#   - fr3_walking_xyz: Tests dynamic scene handling
-#
-# This split ensures:
-#   1. No train/test overlap (prevents overfitting)
-#   2. Sensor diversity (fr1 Kinect v1 + fr3 Kinect v2)
-#   3. Challenge diversity (static, low-texture, dynamic, long-term)
-#   4. Standard benchmarks (fr1_plant, fr1_desk are widely used)
+# Expected performance targets (for reference)
+# - Repeatability: >70% at 3-pixel threshold
+# - Descriptor inlier ratio: >80% for good matches
+# - Mean offset magnitude: <0.5 pixels (sub-pixel accuracy)
+# - Saliency variance: 0.15-0.30 (learning structure)

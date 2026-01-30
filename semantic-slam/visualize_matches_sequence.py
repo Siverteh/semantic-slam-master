@@ -72,17 +72,22 @@ class SequenceMatcher:
         image_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
         patch_features = self.backbone(image_tensor)
-        saliency = self.selector(patch_features)
-        keypoints_patch, scores = self.selector.select_keypoints(
+        saliency, offset_map = self.selector(patch_features)
+        keypoints_subpixel, scores, _ = self.selector.select_keypoints(
             saliency,
+            offset_map,
             num_keypoints=self.config["model"]["num_keypoints"]
         )
+
+        # For descriptor extraction, we need integer patch coordinates (as float for grid_sample)
+        keypoints_patch = keypoints_subpixel.round()
 
         descriptors = self.refiner(
             self.backbone.extract_at_keypoints(patch_features, keypoints_patch)
         )
 
-        keypoints_pixel = self.backbone.patch_to_pixel(keypoints_patch)
+        # Use sub-pixel refined keypoints for visualization
+        keypoints_pixel = self.backbone.patch_to_pixel(keypoints_subpixel)
 
         # Compute per-keypoint intensity on resized image (filters dark regions)
         resized = image.resize(

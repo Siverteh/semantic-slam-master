@@ -62,12 +62,12 @@ class RepeatabilityTester:
         # Extract features
         dino_features = self.backbone(image)
 
-        # Predict saliency
-        saliency_map = self.selector(dino_features)
+        # Predict saliency and offsets
+        saliency_map, offset_map = self.selector(dino_features)
 
-        # Select keypoints (in PATCH coordinates)
-        keypoints_patch, scores = self.selector.select_keypoints(
-            saliency_map,
+        # Select keypoints with sub-pixel refinement (in PATCH coordinates)
+        keypoints_patch, scores, offsets = self.selector.select_keypoints(
+            saliency_map, offset_map,
             num_keypoints=self.config['model']['num_keypoints']
         )
 

@@ -72,10 +72,10 @@ class DescriptorQualityTester:
         # DINOv3 features
         dino_features = self.backbone(image)
 
-        # Keypoint selection
-        saliency_map = self.selector(dino_features)
-        keypoints_patch, scores = self.selector.select_keypoints(
-            saliency_map,
+        # Keypoint selection with sub-pixel offsets
+        saliency_map, offset_map = self.selector(dino_features)
+        keypoints_patch, scores, offsets = self.selector.select_keypoints(
+            saliency_map, offset_map,
             num_keypoints=self.config['model']['num_keypoints']
         )
 

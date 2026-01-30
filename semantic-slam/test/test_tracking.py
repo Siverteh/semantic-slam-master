@@ -69,9 +69,9 @@ class TrackingTester:
     def extract_features(self, image: torch.Tensor):
         """Extract keypoints and descriptors"""
         dino_features = self.backbone(image)
-        saliency_map = self.selector(dino_features)
-        keypoints_patch, scores = self.selector.select_keypoints(
-            saliency_map,
+        saliency_map, offset_map = self.selector(dino_features)
+        keypoints_patch, scores, offsets = self.selector.select_keypoints(
+            saliency_map, offset_map,
             num_keypoints=self.config['model']['num_keypoints']
         )
         feat_at_kpts = self.backbone.extract_at_keypoints(dino_features, keypoints_patch)

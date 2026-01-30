@@ -76,17 +76,19 @@ class MatchVisualizer:
         # Extract DINOv3 features
         dino_features = self.backbone(image_tensor)
 
-        # Keypoint selection
-        saliency_map = self.selector(dino_features)
-        keypoints_patch, scores = self.selector.select_keypoints(
+        # Keypoint selection with sub-pixel refinement
+        saliency_map, offset_map = self.selector(dino_features)
+        keypoints_subpixel, scores, _ = self.selector.select_keypoints(
             saliency_map,
+            offset_map,
             num_keypoints=self.config['model']['num_keypoints']
         )
 
-        # Convert to pixel coordinates
-        keypoints_pixel = self.backbone.patch_to_pixel(keypoints_patch)
+        # Convert to pixel coordinates (using sub-pixel keypoints)
+        keypoints_pixel = self.backbone.patch_to_pixel(keypoints_subpixel)
 
-        # Extract features at keypoints
+        # Extract features at keypoints (need integer coords for indexing)
+        keypoints_patch = keypoints_subpixel.round()
         features_at_kpts = self.backbone.extract_at_keypoints(dino_features, keypoints_patch)
 
         # Refine descriptors

@@ -103,22 +103,24 @@ class PerformanceTester:
 
             # Selector (saliency prediction)
             t0 = time.perf_counter()
-            saliency_map = self.selector(dino_features)
+            saliency_map, offset_map = self.selector(dino_features)
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             t1 = time.perf_counter()
             times['selector'].append((t1 - t0) * 1000)
 
             # Selector (keypoint selection with NMS)
             t0 = time.perf_counter()
-            keypoints_patch, scores = self.selector.select_keypoints(
+            keypoints_subpixel, scores, _ = self.selector.select_keypoints(
                 saliency_map,
+                offset_map,
                 num_keypoints=self.config['model']['num_keypoints']
             )
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             t1 = time.perf_counter()
             times['selector_nms'].append((t1 - t0) * 1000)
 
-            # Refiner
+            # Refiner - use rounded keypoints for feature extraction
+            keypoints_patch = keypoints_subpixel.round()
             feat_at_kpts = self.backbone.extract_at_keypoints(dino_features, keypoints_patch)
             t0 = time.perf_counter()
             descriptors = self.refiner(feat_at_kpts)
@@ -147,14 +149,16 @@ class PerformanceTester:
     def forward_pass(self, image: torch.Tensor):
         """Complete forward pass"""
         dino_features = self.backbone(image)
-        saliency_map = self.selector(dino_features)
-        keypoints_patch, scores = self.selector.select_keypoints(
+        saliency_map, offset_map = self.selector(dino_features)
+        keypoints_subpixel, scores, _ = self.selector.select_keypoints(
             saliency_map,
+            offset_map,
             num_keypoints=self.config['model']['num_keypoints']
         )
+        keypoints_patch = keypoints_subpixel.round()
         feat_at_kpts = self.backbone.extract_at_keypoints(dino_features, keypoints_patch)
         descriptors = self.refiner(feat_at_kpts)
-        return keypoints_patch, descriptors, scores
+        return keypoints_subpixel, descriptors, scores
 
     def measure_memory_usage(self, image: torch.Tensor):
         """Measure GPU memory usage"""
