@@ -1,5 +1,6 @@
 # Training Configuration for Hybrid Semantic-Geometric SLAM
 # Following DINO-VO architecture with geometric constraints
+# FIXED: Simplified loss weights, proper camera handling
 
 # Model architecture
 model:
@@ -69,42 +70,41 @@ dataset:
     rotation: 15  # degrees
     scale: [0.85, 1.15]
 
-# Loss configuration - GEOMETRIC FOCUS!
+# Loss configuration - SIMPLIFIED per research recommendations
+# Following Document 2: Use 3-4 core losses
 loss:
   weights:
-    # Descriptor losses
-    ap: 2.0              # R2D2's AP loss (MAIN descriptor loss)
-    variance: 1.0        # Prevent collapse
-
-    # Geometric losses (CRITICAL!)
-    epipolar: 1.5        # Enforce F matrix constraint
+    # CORE LOSSES (always on)
+    ap: 2.0              # R2D2's AP loss - PRIMARY descriptor loss
+    variance: 1.0        # Prevent descriptor collapse
+    epipolar: 1.5        # Geometric consistency (CRITICAL for SLAM)
     depth_reproj: 1.0    # Use RGB-D depth for 3D consistency
-    photometric: 0.5     # Appearance consistency
 
-    # Detector losses
-    repeatability: 2.0   # Keypoint stability (INCREASED from 0.5)
-    semantic_edge: 1.5   # Your idea! Align with semantic boundaries (INCREASED from 0.3)
+    # SECONDARY LOSSES (lower weight)
+    repeatability: 0.5   # Keypoint stability across frames
+    semantic_edge: 0.5   # Your contribution: semantic boundary alignment (FIXED formula)
 
-    # Sub-pixel loss
-    offset: 0.5          # Offset prediction accuracy
+    # OPTIONAL LOSSES (can disable for debugging)
+    photometric: 0.3     # Appearance consistency (expensive)
+    offset: 0.5          # Sub-pixel refinement (Stage 3 only)
 
   # AP loss config
   ap_kappa: 0.5         # Minimum expected AP
 
   # Epipolar config
-  epipolar_threshold: 3.0  # pixels
+  epipolar_threshold: 3.0  # pixels, used as beta for smooth_l1_loss
 
   # Variance config
   min_variance: 0.005   # For 128-dim descriptors
 
 # Training configuration - 3 STAGE APPROACH
 training:
-  # Stage 1: Geometric CNN pre-training (2 weeks)
+  # Stage 1: Geometric CNN pre-training (1 week)
   stage1_epochs: 10
   stage1_lr: 1e-4
   stage1_focus: "geometric"  # Train only geometric CNN
 
-  # Stage 2: Full training (3 weeks)
+  # Stage 2: Full training (2-3 weeks)
   stage2_epochs: 40
   stage2_lr: 1e-4
   stage2_lr_min: 1e-6
@@ -127,10 +127,11 @@ training:
 logging:
   use_wandb: false
   project: "semantic-slam-hybrid"
-  run_name: "dino-cnn-geometric-v1"
+  run_name: "dino-cnn-geometric-v2-fixed"
   log_interval: 50
 
 # Camera intrinsics (TUM RGB-D)
+# NOTE: Now properly loaded per-sample from batch in train.py
 camera:
   # Freiburg 1 & 2
   fr1_fx: 517.3

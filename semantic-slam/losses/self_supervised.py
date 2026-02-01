@@ -1,6 +1,10 @@
 """
 Self-Supervised Losses with R2D2's AP Loss
 Better than triplet loss for descriptor learning.
+
+FIXES:
+- Semantic edge loss formula (was returning negative values)
+- Added safety checks for NaN/Inf
 """
 
 import torch
@@ -70,6 +74,7 @@ class APLoss(nn.Module):
             gt_matrix[idx1, idx2] = 1.0
 
             # Compute AP for each query
+            query_losses = []
             for i in range(N):
                 # Skip if no ground truth
                 if gt_matrix[i].sum() == 0:
@@ -94,14 +99,18 @@ class APLoss(nn.Module):
                 # Loss: 1 - AP
                 loss_i = 1.0 - ap
 
-                if not torch.isnan(loss_i):
-                    total_loss += loss_i
-                    num_valid += 1
+                if not torch.isnan(loss_i) and not torch.isinf(loss_i):
+                    query_losses.append(loss_i)
+
+            if len(query_losses) > 0:
+                total_loss += torch.stack(query_losses).mean()
+                num_valid += 1
 
         if num_valid > 0:
             return total_loss / num_valid
         else:
-            return torch.tensor(0.1, device=device, requires_grad=True)
+            # Return small positive loss if no valid queries
+            return torch.tensor(0.5, device=device, requires_grad=True)
 
 
 class DescriptorVarianceLoss(nn.Module):
@@ -149,7 +158,9 @@ class RepeatabilityLoss(nn.Module):
 class SemanticEdgeLoss(nn.Module):
     """
     Loss to encourage saliency at semantic edges.
-    Your idea! Keypoints should align with object boundaries.
+    Uses DINO feature gradients (not handcrafted Sobel/Canny).
+
+    FIXED: Correlation loss now returns positive values in [0, 1]
     """
 
     def __init__(self):
@@ -168,24 +179,31 @@ class SemanticEdgeLoss(nn.Module):
             semantic_edges: (B, H, W, 1) semantic edge strength
 
         Returns:
-            loss: Correlation loss
+            loss: Correlation loss in [0, 1] where 0 is best
         """
         B, H, W, _ = saliency_map.shape
 
         sal_flat = saliency_map.reshape(B, -1)
         edge_flat = semantic_edges.reshape(B, -1)
 
-        # Normalize
+        # Normalize (zero mean)
         sal_norm = sal_flat - sal_flat.mean(dim=1, keepdim=True)
         edge_norm = edge_flat - edge_flat.mean(dim=1, keepdim=True)
 
-        # Pearson correlation
-        correlation = (sal_norm * edge_norm).sum(dim=1) / (
-            torch.sqrt((sal_norm ** 2).sum(dim=1) * (edge_norm ** 2).sum(dim=1)) + 1e-8
+        # Compute Pearson correlation coefficient
+        numerator = (sal_norm * edge_norm).sum(dim=1)
+        denominator = torch.sqrt(
+            (sal_norm ** 2).sum(dim=1) * (edge_norm ** 2).sum(dim=1) + 1e-8
         )
+        correlation = numerator / denominator  # Range: [-1, 1]
 
-        # Maximize correlation (minimize negative)
-        # Add 1 to shift to [0, 2] range, then divide by 2 to get [0, 1]
-        loss = -(correlation.mean() + 1.0) / 2.0
+        # FIXED: Convert to loss in [0, 1]
+        # Perfect positive correlation (1.0) -> loss 0.0
+        # No correlation (0.0) -> loss 0.5
+        # Perfect negative correlation (-1.0) -> loss 1.0
+        loss = 1.0 - (correlation.mean() + 1.0) / 2.0
+
+        # Clamp to ensure valid range
+        loss = torch.clamp(loss, 0.0, 1.0)
 
         return loss

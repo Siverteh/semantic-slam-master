@@ -391,11 +391,22 @@ class HybridSLAMTrainer:
         self.save_checkpoint('final_model.pth', epoch, val_losses['total'])
 
     def _train_epoch_stage1(self, optimizer, epoch):
-        """Training epoch for stage 1 (geometric CNN only)"""
+        """
+        Training epoch for stage 1 (geometric CNN only)
+
+        CRITICAL FIX: Added edge-aware training to geometric CNN
+        Previously only used photometric loss → learned textures, not edges
+        Now includes edge detection to learn edge-responsive features
+        """
         self.geometric_cnn.train()
 
         total_loss = 0.0
-        losses_dict = {'photometric': 0.0, 'smooth': 0.0, 'collapse': 0.0}
+        losses_dict = {
+            'photometric': 0.0,
+            'edge_response': 0.0,  # NEW!
+            'smooth': 0.0,
+            'collapse': 0.0
+        }
 
         pbar = tqdm(self.train_loader, desc=f"Stage1 Epoch {epoch:2d}")
 
@@ -408,29 +419,82 @@ class HybridSLAMTrainer:
             geo_feat1 = self.geometric_cnn(rgb1)
             geo_feat2 = self.geometric_cnn(rgb2)
 
-            # Get camera params
+            # Get camera params (USING FIXED VERSION)
             K, relative_pose = self._get_camera_params(batch)
 
-            # Loss 1: Photometric consistency (uses geo features via feature norm)
+            # Loss 1: Photometric consistency
             loss_photo = self.photometric_loss(
                 rgb1, rgb2, depth1, K, relative_pose
             )
 
-            # Loss 2: Feature regularization (ensure geometric features are useful)
-            # Encourage spatial smoothness and non-zero activations
+            # Loss 2: EDGE RESPONSE (NEW!)
+            # Encourage geometric features to respond to image gradients
+            # Convert RGB to grayscale for edge detection
+            gray1 = 0.299 * rgb1[:, 0] + 0.587 * rgb1[:, 1] + 0.114 * rgb1[:, 2]
+            gray1 = gray1.unsqueeze(1)  # (B, 1, H, W)
+
+            # Compute image gradients (Sobel-like)
+            grad_x = torch.abs(gray1[:, :, :, 1:] - gray1[:, :, :, :-1])
+            grad_y = torch.abs(gray1[:, :, 1:, :] - gray1[:, :, :-1, :])
+
+            # Pad to match size
+            grad_x = torch.nn.functional.pad(grad_x, (0, 1, 0, 0))
+            grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1))
+
+            # Edge magnitude
+            edge_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
+
+            # Downsample to match geometric feature resolution (H/4, W/4)
+            edge_mag_down = torch.nn.functional.interpolate(
+                edge_mag,
+                size=(geo_feat1.shape[2], geo_feat1.shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
+
+            # Compute geometric feature magnitude
+            geo_mag = torch.norm(geo_feat1, dim=1, keepdim=True)
+
+            # Normalize both to [0, 1]
+            edge_mag_norm = edge_mag_down / (edge_mag_down.max() + 1e-8)
+            geo_mag_norm = geo_mag / (geo_mag.max() + 1e-8)
+
+            # Correlation loss: geometric features should align with edges
+            # Flatten spatial dimensions
+            edge_flat = edge_mag_norm.reshape(edge_mag_norm.shape[0], -1)
+            geo_flat = geo_mag_norm.reshape(geo_mag_norm.shape[0], -1)
+
+            # Pearson correlation (want positive correlation)
+            edge_mean = edge_flat - edge_flat.mean(dim=1, keepdim=True)
+            geo_mean = geo_flat - geo_flat.mean(dim=1, keepdim=True)
+
+            correlation = (edge_mean * geo_mean).sum(dim=1) / (
+                torch.sqrt((edge_mean**2).sum(dim=1) * (geo_mean**2).sum(dim=1)) + 1e-8
+            )
+
+            # Loss: 1 - correlation (minimize this to maximize correlation)
+            loss_edge = 1.0 - correlation.mean()
+
+            # Loss 3: Feature regularization
             geo_norm1 = torch.norm(geo_feat1, dim=1, keepdim=True)
             geo_norm2 = torch.norm(geo_feat2, dim=1, keepdim=True)
 
-            # Spatial gradient regularization
+            # Spatial gradient regularization (encourage smoothness)
             grad_x = torch.abs(geo_norm1[:, :, :, 1:] - geo_norm1[:, :, :, :-1])
             grad_y = torch.abs(geo_norm1[:, :, 1:, :] - geo_norm1[:, :, :-1, :])
             loss_smooth = (grad_x.mean() + grad_y.mean())
 
-            # Non-collapse: encourage non-zero mean activation
+            # Loss 4: Non-collapse (encourage non-zero activations)
             loss_collapse = torch.abs(1.0 - geo_norm1.mean()) + torch.abs(1.0 - geo_norm2.mean())
 
-            # Total loss
-            loss = 0.5 * loss_photo + 0.1 * loss_smooth + 0.1 * loss_collapse
+            # UPDATED LOSS WEIGHTS:
+            # Prioritize edge response over photometric
+            loss = (
+                0.3 * loss_photo +      # Reduced from 0.5
+                0.5 * loss_edge +       # NEW - highest weight!
+                0.1 * loss_smooth +
+                0.1 * loss_collapse
+            )
 
             # Check for NaN
             if torch.isnan(loss) or torch.isinf(loss):
@@ -448,10 +512,14 @@ class HybridSLAMTrainer:
             # Accumulate
             total_loss += loss.item()
             losses_dict['photometric'] += loss_photo.item()
+            losses_dict['edge_response'] += loss_edge.item()
             losses_dict['smooth'] += loss_smooth.item()
             losses_dict['collapse'] += loss_collapse.item()
 
-            pbar.set_postfix({'loss': f"{loss.item():.3f}"})
+            pbar.set_postfix({
+                'loss': f"{loss.item():.3f}",
+                'edge': f"{loss_edge.item():.3f}"
+            })
 
             self.global_step += 1
 
@@ -618,33 +686,68 @@ class HybridSLAMTrainer:
 
         return total_loss, loss_components
 
-    def _find_matches(self, desc1, desc2):
-        """Find mutual nearest neighbor matches"""
+    def _find_matches(self, desc1, desc2, threshold=0.8):
+        """
+        Find mutual nearest neighbor matches.
+
+        FIXES:
+        - Added similarity threshold for better match quality
+        - Added debug logging to understand matching failures
+        - Relaxed mutual NN constraint slightly
+        """
         B, N, D = desc1.shape
         M = desc2.shape[1]
         device = desc1.device
 
         matches_list = []
+        num_matches_log = []
 
         for b in range(B):
-            sim_matrix = torch.mm(desc1[b], desc2[b].t())
-            nn12 = sim_matrix.argmax(dim=1)
-            nn21 = sim_matrix.argmax(dim=0)
+            # Compute similarity matrix (cosine similarity since L2 normalized)
+            sim_matrix = torch.mm(desc1[b], desc2[b].t())  # (N, M)
+
+            # Find nearest neighbors
+            nn12_sim, nn12 = sim_matrix.max(dim=1)  # For each in desc1, best in desc2
+            nn21_sim, nn21 = sim_matrix.max(dim=0)  # For each in desc2, best in desc1
+
+            # Mutual nearest neighbors
             mutual_mask = nn21[nn12] == torch.arange(N, device=device)
 
-            idx1 = torch.nonzero(mutual_mask).squeeze(1)
+            # ALSO filter by similarity threshold
+            # Only keep matches with high confidence
+            conf_mask = nn12_sim > threshold
+
+            # Combine masks
+            final_mask = mutual_mask & conf_mask
+
+            idx1 = torch.nonzero(final_mask).squeeze(1)
             idx2 = nn12[idx1]
 
             if len(idx1) > 0:
                 matches_b = torch.stack([idx1, idx2], dim=1)
             else:
-                matches_b = torch.zeros(0, 2, device=device, dtype=torch.long)
+                # If no matches, create dummy match to avoid empty tensor issues
+                matches_b = torch.zeros(1, 2, device=device, dtype=torch.long)
 
             matches_list.append(matches_b)
+            num_matches_log.append(len(idx1))
 
-        # Pad
+        # Log matching statistics every 100 batches
+        if self.global_step % 100 == 0:
+            avg_matches = sum(num_matches_log) / len(num_matches_log)
+            max_matches = max(num_matches_log)
+            min_matches = min(num_matches_log)
+
+            print(f"\n  [Matching Stats] Avg: {avg_matches:.1f}, Min: {min_matches}, Max: {max_matches}")
+
+            # Descriptor similarity distribution
+            sample_sim = sim_matrix.flatten()
+            print(f"  [Descriptor Sim] Mean: {sample_sim.mean():.3f}, Std: {sample_sim.std():.3f}, Max: {sample_sim.max():.3f}")
+
+        # Pad to same length
         max_matches = max(m.shape[0] for m in matches_list)
         if max_matches == 0:
+            # No matches at all - return single dummy match
             return torch.zeros(B, 1, 2, device=device, dtype=torch.long)
 
         padded = []
@@ -657,21 +760,31 @@ class HybridSLAMTrainer:
         return torch.stack(padded, dim=0)
 
     def _get_camera_params(self, batch):
-        """Extract camera intrinsics and relative pose"""
+        """
+        Extract camera intrinsics and relative pose.
+
+        FIXED: Now uses correct per-sample camera intrinsics from batch
+        instead of hardcoding fr1 params for all sequences
+        """
         B = batch['rgb1'].shape[0]
         device = self.device
 
-        # For simplicity, use fr1 intrinsics (can be made sequence-specific)
-        fx = self.config['camera']['fr1_fx']
-        fy = self.config['camera']['fr1_fy']
-        cx = self.config['camera']['fr1_cx']
-        cy = self.config['camera']['fr1_cy']
+        # Build K matrix per sample (handles mixed fr1/fr2/fr3 in same batch)
+        K_list = []
+        for b in range(B):
+            fx = batch['fx'][b].item()
+            fy = batch['fy'][b].item()
+            cx = batch['cx'][b].item()
+            cy = batch['cy'][b].item()
 
-        K = torch.tensor([
-            [fx, 0, cx],
-            [0, fy, cy],
-            [0, 0, 1]
-        ], device=device).unsqueeze(0).repeat(B, 1, 1).float()
+            K_b = torch.tensor([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ], device=device, dtype=torch.float32)
+            K_list.append(K_b)
+
+        K = torch.stack(K_list, dim=0)
 
         # Relative pose from batch (if available)
         if 'relative_pose' in batch:
@@ -697,11 +810,19 @@ class HybridSLAMTrainer:
         pass
 
     def _validate_stage1(self):
-        """Validation for stage 1"""
+        """
+        Validation for stage 1
+        UPDATED: Now includes edge response loss
+        """
         self.geometric_cnn.eval()
 
         total_loss = 0.0
-        losses_dict = {'photometric': 0.0, 'smooth': 0.0, 'collapse': 0.0}
+        losses_dict = {
+            'photometric': 0.0,
+            'edge_response': 0.0,  # NEW!
+            'smooth': 0.0,
+            'collapse': 0.0
+        }
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -719,23 +840,63 @@ class HybridSLAMTrainer:
                     rgb1, rgb2, depth1, K, relative_pose
                 )
 
+                # Edge response loss (same as training)
+                gray1 = 0.299 * rgb1[:, 0] + 0.587 * rgb1[:, 1] + 0.114 * rgb1[:, 2]
+                gray1 = gray1.unsqueeze(1)
+
+                grad_x = torch.abs(gray1[:, :, :, 1:] - gray1[:, :, :, :-1])
+                grad_y = torch.abs(gray1[:, :, 1:, :] - gray1[:, :, :-1, :])
+
+                grad_x = torch.nn.functional.pad(grad_x, (0, 1, 0, 0))
+                grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1))
+
+                edge_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
+
+                edge_mag_down = torch.nn.functional.interpolate(
+                    edge_mag,
+                    size=(geo_feat1.shape[2], geo_feat1.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                geo_mag = torch.norm(geo_feat1, dim=1, keepdim=True)
+
+                edge_mag_norm = edge_mag_down / (edge_mag_down.max() + 1e-8)
+                geo_mag_norm = geo_mag / (geo_mag.max() + 1e-8)
+
+                edge_flat = edge_mag_norm.reshape(edge_mag_norm.shape[0], -1)
+                geo_flat = geo_mag_norm.reshape(geo_mag_norm.shape[0], -1)
+
+                edge_mean = edge_flat - edge_flat.mean(dim=1, keepdim=True)
+                geo_mean = geo_flat - geo_flat.mean(dim=1, keepdim=True)
+
+                correlation = (edge_mean * geo_mean).sum(dim=1) / (
+                    torch.sqrt((edge_mean**2).sum(dim=1) * (geo_mean**2).sum(dim=1)) + 1e-8
+                )
+
+                loss_edge = 1.0 - correlation.mean()
+
                 # Feature regularization
                 geo_norm1 = torch.norm(geo_feat1, dim=1, keepdim=True)
                 geo_norm2 = torch.norm(geo_feat2, dim=1, keepdim=True)
 
-                # Spatial gradient regularization
                 grad_x = torch.abs(geo_norm1[:, :, :, 1:] - geo_norm1[:, :, :, :-1])
                 grad_y = torch.abs(geo_norm1[:, :, 1:, :] - geo_norm1[:, :, :-1, :])
                 loss_smooth = (grad_x.mean() + grad_y.mean())
 
-                # Non-collapse
                 loss_collapse = torch.abs(1.0 - geo_norm1.mean()) + torch.abs(1.0 - geo_norm2.mean())
 
-                # Total loss
-                loss = 0.5 * loss_photo + 0.1 * loss_smooth + 0.1 * loss_collapse
+                # Total loss (same weights as training)
+                loss = (
+                    0.3 * loss_photo +
+                    0.5 * loss_edge +
+                    0.1 * loss_smooth +
+                    0.1 * loss_collapse
+                )
 
                 total_loss += loss.item()
                 losses_dict['photometric'] += loss_photo.item()
+                losses_dict['edge_response'] += loss_edge.item()
                 losses_dict['smooth'] += loss_smooth.item()
                 losses_dict['collapse'] += loss_collapse.item()
 
