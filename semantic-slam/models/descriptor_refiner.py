@@ -1,6 +1,6 @@
 """
-Improved Descriptor Refiner with Residual Connections
-Following DINO-VO and R2D2 best practices for discriminative descriptors
+Descriptor Refiner for Fused Semantic+Geometric Features
+Handles concatenated DINO (384-dim) + CNN (64-dim) = 448-dim input
 """
 
 import torch
@@ -10,21 +10,20 @@ import torch.nn.functional as F
 
 class DescriptorRefiner(nn.Module):
     """
-    Refine DINOv3 384-dim features → compact 128-dim descriptors.
+    Refine fused semantic+geometric features into compact descriptors.
 
-    IMPROVEMENTS over v1:
-    1. Residual connections for better gradient flow
-    2. Slightly more capacity (384 hidden instead of 256)
-    3. LayerNorm for stability
-    4. Still L2 norm only at the end (per R2D2)
+    Input: 256-dim fused features (from FeatureFusion module)
+    Output: 128-dim L2-normalized descriptors
+
+    Architecture: Residual MLP with careful normalization
     """
 
     def __init__(
         self,
-        input_dim: int = 384,
-        hidden_dim: int = 384,  # Increased from 256
+        input_dim: int = 256,  # After fusion
+        hidden_dim: int = 256,
         output_dim: int = 128,
-        num_layers: int = 4     # Increased from 3
+        num_layers: int = 3
     ):
         super().__init__()
 
@@ -34,9 +33,9 @@ class DescriptorRefiner(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
-        # Residual blocks (with LayerNorm for stability)
+        # Residual blocks
         self.residual_blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim) for _ in range(num_layers - 2)
+            ResidualBlock(hidden_dim) for _ in range(num_layers)
         ])
 
         # Output projection
@@ -45,57 +44,49 @@ class DescriptorRefiner(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Orthogonal initialization for maximum diversity.
-        Critical for preventing descriptor collapse.
-        """
+        """Orthogonal initialization for maximum diversity"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.uniform_(m.bias, -0.1, 0.1)
 
-    def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, fused_features: torch.Tensor) -> torch.Tensor:
         """
         Refine features into descriptors.
 
-        CRITICAL: L2 normalization is ONLY at the end (per R2D2).
-
         Args:
-            dino_features: (B, N, C) features at keypoints
+            fused_features: (B, N, input_dim) fused semantic+geometric features
 
         Returns:
             descriptors: (B, N, output_dim) L2-normalized descriptors
         """
-        B, N, C = dino_features.shape
+        B, N, C = fused_features.shape
 
         # Flatten
-        x = dino_features.reshape(B * N, C)
+        x = fused_features.reshape(B * N, C)
 
         # Input projection
         x = F.relu(self.input_proj(x))
 
-        # Residual blocks (better gradient flow)
+        # Residual blocks
         for block in self.residual_blocks:
             x = block(x)
 
         # Output projection
         descriptors = self.output_proj(x)
 
-        # L2 normalize ONLY at the very end (per R2D2/DINO-VO)
+        # L2 normalize (CRITICAL for descriptor matching)
         descriptors = F.normalize(descriptors, p=2, dim=-1)
 
-        # Reshape back
+        # Reshape
         descriptors = descriptors.reshape(B, N, self.output_dim)
 
         return descriptors
 
 
 class ResidualBlock(nn.Module):
-    """
-    Simple residual block with LayerNorm.
-    Helps with gradient flow and training stability.
-    """
+    """Residual block with LayerNorm"""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -106,20 +97,14 @@ class ResidualBlock(nn.Module):
         self.fc2 = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Residual block: x + F(x)
-        """
         identity = x
 
-        # First transform
         out = self.norm1(x)
         out = F.relu(self.fc1(out))
 
-        # Second transform
         out = self.norm2(out)
         out = self.fc2(out)
 
-        # Residual connection
         out = out + identity
         out = F.relu(out)
 

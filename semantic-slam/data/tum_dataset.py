@@ -1,6 +1,6 @@
 """
 TUM RGB-D Dataset Loader
-FIXED: Added data augmentation for better generalization
+Now includes proper camera intrinsics for each sequence.
 """
 
 import os
@@ -14,11 +14,28 @@ import torchvision.transforms as transforms
 import random
 
 
+# Camera intrinsics for each Freiburg version
+CAMERA_PARAMS = {
+    'freiburg1': {
+        'fx': 517.3, 'fy': 516.5,
+        'cx': 318.6, 'cy': 255.3,
+        'width': 640, 'height': 480
+    },
+    'freiburg2': {
+        'fx': 520.9, 'fy': 521.0,
+        'cx': 325.1, 'cy': 249.7,
+        'width': 640, 'height': 480
+    },
+    'freiburg3': {
+        'fx': 535.4, 'fy': 539.2,
+        'cx': 320.1, 'cy': 247.6,
+        'width': 640, 'height': 480
+    }
+}
+
+
 class TUMDataset(Dataset):
-    """
-    TUM RGB-D dataset for self-supervised training.
-    Returns pairs of consecutive frames with depth and pose information.
-    """
+    """TUM RGB-D dataset with proper camera handling"""
 
     def __init__(
         self,
@@ -30,16 +47,6 @@ class TUMDataset(Dataset):
         augmentation: Optional[dict] = None,
         is_train: bool = True
     ):
-        """
-        Args:
-            dataset_root: Path to TUM RGB-D dataset root
-            sequence: Sequence name
-            input_size: Image size for DINOv3
-            frame_spacing: Spacing between consecutive frames
-            max_frames: Maximum frames to use
-            augmentation: Dict with augmentation params (only applied if is_train=True)
-            is_train: Whether this is training (apply augmentation) or validation
-        """
         dataset_root_path = Path(dataset_root)
         if not dataset_root_path.is_absolute():
             project_root = Path(__file__).resolve().parents[1]
@@ -51,22 +58,34 @@ class TUMDataset(Dataset):
         self.frame_spacing = frame_spacing
         self.is_train = is_train
 
+        # Determine camera parameters
+        if 'freiburg1' in sequence:
+            self.camera_params = CAMERA_PARAMS['freiburg1']
+            self.camera_version = 'freiburg1'
+        elif 'freiburg2' in sequence:
+            self.camera_params = CAMERA_PARAMS['freiburg2']
+            self.camera_version = 'freiburg2'
+        elif 'freiburg3' in sequence:
+            self.camera_params = CAMERA_PARAMS['freiburg3']
+            self.camera_version = 'freiburg3'
+        else:
+            # Default to freiburg1
+            self.camera_params = CAMERA_PARAMS['freiburg1']
+            self.camera_version = 'freiburg1'
+
         # Paths
         candidate_sequence_dir = self.dataset_root / sequence
         if candidate_sequence_dir.exists():
             self.sequence_dir = candidate_sequence_dir
         else:
-            # Allow dataset_root to point directly to a sequence directory
             self.sequence_dir = self.dataset_root
+
         self.rgb_dir = self.sequence_dir / "rgb"
         self.depth_dir = self.sequence_dir / "depth"
         self.gt_file = self.sequence_dir / "groundtruth.txt"
 
         # Verify paths
-        assert self.sequence_dir.exists(), (
-            "Sequence not found. Checked: "
-            f"{candidate_sequence_dir} and {self.dataset_root}"
-        )
+        assert self.sequence_dir.exists(), f"Sequence not found: {self.sequence_dir}"
         assert self.rgb_dir.exists(), f"RGB directory not found: {self.rgb_dir}"
         assert self.depth_dir.exists(), f"Depth directory not found: {self.depth_dir}"
 
@@ -84,7 +103,7 @@ class TUMDataset(Dataset):
             if self.poses is not None:
                 self.poses = self.poses[:max_frames]
 
-        # Base transforms (no augmentation)
+        # Base transforms
         self.base_transform = transforms.Compose([
             transforms.Resize((input_size, input_size)),
             transforms.ToTensor(),
@@ -94,7 +113,7 @@ class TUMDataset(Dataset):
             )
         ])
 
-        # Augmentation transforms (following R2D2/SuperPoint)
+        # Augmentation
         self.augmentation = augmentation if (augmentation and is_train) else None
         if self.augmentation and self.augmentation.get('enabled', False):
             self.color_jitter = transforms.ColorJitter(
@@ -112,18 +131,14 @@ class TUMDataset(Dataset):
         ])
 
         print(f"Loaded TUM sequence: {sequence}")
+        print(f"  Camera: {self.camera_version}")
         print(f"  Frames: {len(self.rgb_files)}")
-        print(f"  Input size: {input_size}x{input_size}")
-        print(f"  Frame spacing: {frame_spacing}")
-        print(f"  Augmentation: {'enabled' if self.augmentation else 'disabled'}")
+        print(f"  Intrinsics: fx={self.camera_params['fx']:.1f}, fy={self.camera_params['fy']:.1f}")
 
     def __len__(self) -> int:
         return max(0, len(self.rgb_files) - self.frame_spacing)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Returns a pair of consecutive frames with metadata.
-        """
         idx1 = idx
         idx2 = idx + self.frame_spacing
 
@@ -139,16 +154,11 @@ class TUMDataset(Dataset):
         depth1_array = np.array(depth1).astype(np.float32) / 5000.0
         depth2_array = np.array(depth2).astype(np.float32) / 5000.0
 
-        # Apply augmentation to RGB (not depth!)
+        # Apply augmentation
         if self.augmentation:
-            # Same augmentation for both frames (consistency)
             seed = random.randint(0, 2**32 - 1)
-
-            # Frame 1
             random.seed(seed)
             rgb1 = self._apply_augmentation(rgb1)
-
-            # Frame 2 (same augmentation)
             random.seed(seed)
             rgb2 = self._apply_augmentation(rgb2)
 
@@ -179,15 +189,18 @@ class TUMDataset(Dataset):
             'depth1': depth1_tensor,
             'depth2': depth2_tensor,
             'timestamp1': self.timestamps[idx1],
-            'timestamp2': self.timestamps[idx2]
+            'timestamp2': self.timestamps[idx2],
+            'camera_version': self.camera_version,
+            'fx': self.camera_params['fx'],
+            'fy': self.camera_params['fy'],
+            'cx': self.camera_params['cx'],
+            'cy': self.camera_params['cy']
         }
 
         # Add poses if available
         if self.poses is not None:
             pose1 = self.poses[idx1]
             pose2 = self.poses[idx2]
-
-            # Relative pose: T_rel = T2 @ T1^-1
             relative_pose = pose2 @ np.linalg.inv(pose1)
 
             output['pose1'] = torch.from_numpy(pose1).float()
@@ -197,11 +210,9 @@ class TUMDataset(Dataset):
         return output
 
     def _apply_augmentation(self, image: Image.Image) -> Image.Image:
-        """Apply color jitter and blur augmentation"""
-        # Color jitter
+        """Apply augmentation"""
         image = self.color_jitter(image)
 
-        # Gaussian blur (with probability)
         if random.random() < self.blur_prob:
             image = self.gaussian_blur(image)
 
@@ -212,19 +223,13 @@ class TUMDataset(Dataset):
         rgb_files = sorted([f for f in os.listdir(self.rgb_dir) if f.endswith('.png')])
         depth_files = sorted([f for f in os.listdir(self.depth_dir) if f.endswith('.png')])
 
-        # Extract timestamps
         timestamps = [float(f.split('.')[0]) for f in rgb_files]
 
-        # Ensure same length
         min_len = min(len(rgb_files), len(depth_files))
-        rgb_files = rgb_files[:min_len]
-        depth_files = depth_files[:min_len]
-        timestamps = timestamps[:min_len]
-
-        return rgb_files, depth_files, timestamps
+        return rgb_files[:min_len], depth_files[:min_len], timestamps[:min_len]
 
     def _load_groundtruth(self) -> np.ndarray:
-        """Load ground truth poses from groundtruth.txt"""
+        """Load ground truth poses"""
         poses = []
         timestamps_gt = []
 
@@ -256,7 +261,7 @@ class TUMDataset(Dataset):
 
     @staticmethod
     def _quat_to_matrix(qx, qy, qz, qw, tx, ty, tz) -> np.ndarray:
-        """Convert quaternion and translation to 4x4 transformation matrix"""
+        """Convert quaternion to 4x4 matrix"""
         norm = np.sqrt(qx**2 + qy**2 + qz**2 + qw**2)
         qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
 

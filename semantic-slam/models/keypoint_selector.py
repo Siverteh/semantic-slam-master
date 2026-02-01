@@ -1,9 +1,7 @@
 """
-FIXED Keypoint Selector - Actually Uses Saliency Properly!
-CRITICAL FIXES:
-1. Better thresholding (percentile-based, not absolute)
-2. Smart fallback (samples from high-saliency regions only)
-3. No uniform grid fallback (that was causing dark monitor selections)
+Semantic Edge-based Keypoint Detector
+Grid-aligned detection following DINO-VO architecture.
+Detects keypoints at semantic discontinuities (your idea!)
 """
 
 import torch
@@ -14,55 +12,114 @@ from typing import Tuple
 
 class KeypointSelector(nn.Module):
     """
-    Keypoint selector with PROPER saliency-based selection.
+    Semantic edge-based keypoint detector.
 
-    Key fix: Never falls back to uniform sampling!
+    Key ideas:
+    1. Detect semantic discontinuities in DINO features (edges between objects)
+    2. Grid-aligned to 16×16 patches (ensures each keypoint queries one DINO patch)
+    3. Learnable refinement on top of gradient-based detection
+
+    This combines:
+    - Your idea: semantic edges are good keypoints!
+    - DINO-VO: grid-aligned detection for coarse features
+    - Geometric constraints: edges correspond to 3D boundaries
     """
 
     def __init__(
         self,
         input_dim: int = 384,
-        hidden_dim: int = 128
+        patch_size: int = 16
     ):
         super().__init__()
 
-        # Simple 2-layer CNN
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
+        self.input_dim = input_dim
+        self.patch_size = patch_size
+
+        # Learnable edge detector (refines gradient-based detection)
+        self.edge_refiner = nn.Sequential(
+            nn.Conv2d(input_dim, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=1)
         )
 
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize with small weights"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, 0)
+
+    def compute_semantic_edges(
+        self,
+        dino_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute semantic edge strength from DINO features.
+
+        This is your idea! Semantic discontinuities = object boundaries = good keypoints.
+
+        Args:
+            dino_features: (B, H, W, C) DINO patch features
+
+        Returns:
+            edge_strength: (B, H, W, 1) semantic edge magnitudes
+        """
+        # Convert to (B, C, H, W) for convolution
+        features = dino_features.permute(0, 3, 1, 2)
+
+        # Compute gradients in feature space
+        grad_x = features[:, :, :, 1:] - features[:, :, :, :-1]  # (B, C, H, W-1)
+        grad_y = features[:, :, 1:, :] - features[:, :, :-1, :]  # (B, C, H-1, W)
+
+        # Pad to same size
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))  # Pad right
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))  # Pad bottom
+
+        # L2 norm across feature dimensions = edge strength
+        edge_strength = torch.sqrt(
+            (grad_x ** 2).sum(dim=1, keepdim=True) +
+            (grad_y ** 2).sum(dim=1, keepdim=True) +
+            1e-8
+        )
+
+        # Normalize to [0, 1]
+        edge_strength = edge_strength / (edge_strength.max() + 1e-8)
+
+        # Convert back to (B, H, W, 1)
+        edge_strength = edge_strength.permute(0, 2, 3, 1)
+
+        return edge_strength
 
     def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
         """
-        Predict per-patch saliency scores.
+        Predict keypoint saliency map.
+
+        Combines:
+        - Geometric edge detection (gradient-based)
+        - Learned refinement (neural network)
 
         Args:
-            dino_features: (B, H, W, C) in PATCH space
+            dino_features: (B, H, W, C) in PATCH space (28×28 for 448×448 input)
 
         Returns:
             saliency_map: (B, H, W, 1) scores in [0, 1]
         """
-        # Convert to (B, C, H, W)
-        x = dino_features.permute(0, 3, 1, 2)
+        # Compute semantic edges (your idea!)
+        semantic_edges = self.compute_semantic_edges(dino_features)
 
-        # Predict logits
-        logits = self.conv(x)
+        # Learned refinement
+        features_bchw = dino_features.permute(0, 3, 1, 2)
+        learned_saliency = self.edge_refiner(features_bchw)
+        learned_saliency = torch.sigmoid(learned_saliency)
+        learned_saliency = learned_saliency.permute(0, 2, 3, 1)
 
-        # Apply SIGMOID (not softmax!)
-        saliency = torch.sigmoid(logits)
-
-        # Convert back to (B, H, W, 1)
-        saliency_map = saliency.permute(0, 2, 3, 1)
+        # Combine: geometric edges guide learned saliency
+        saliency_map = 0.5 * semantic_edges + 0.5 * learned_saliency
 
         return saliency_map
 
@@ -70,23 +127,20 @@ class KeypointSelector(nn.Module):
         self,
         saliency_map: torch.Tensor,
         num_keypoints: int = 500,
-        nms_radius: int = 2,
-        min_score_percentile: float = 0.50  # NEW: Use top 50% of scores
+        nms_radius: int = 2
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Select keypoints using PERCENTILE-BASED thresholding.
+        Select keypoints using grid-aligned detection.
 
-        CRITICAL FIX: Never uses uniform fallback!
-        Always selects from high-saliency regions.
+        CRITICAL: Grid-aligned to ensure each keypoint queries exactly one DINO patch.
 
         Args:
-            saliency_map: (B, H, W, 1) independent scores
-            num_keypoints: Target number of keypoints
-            nms_radius: NMS radius
-            min_score_percentile: Minimum percentile (0.5 = top 50%)
+            saliency_map: (B, H, W, 1) saliency scores
+            num_keypoints: Number of keypoints to select
+            nms_radius: NMS radius in patch space
 
         Returns:
-            keypoints: (B, N, 2) in PATCH coordinates
+            keypoints: (B, N, 2) in PATCH coordinates [0, H-1] x [0, W-1]
             scores: (B, N) saliency scores
         """
         B, H, W, _ = saliency_map.shape
@@ -100,113 +154,42 @@ class KeypointSelector(nn.Module):
         for b in range(B):
             sal_b = saliency[b]
 
-            # STEP 1: Compute ADAPTIVE threshold (percentile-based)
-            # This ensures we always select from high-saliency regions!
-            sal_flat = sal_b.flatten()
-            threshold = torch.quantile(sal_flat, min_score_percentile)
-
-            # Ensure minimum threshold (avoid selecting noise)
-            threshold = max(threshold.item(), 0.1)
-
-            # STEP 2: Apply NMS
+            # Apply NMS
             sal_nms = self._apply_nms(sal_b.unsqueeze(0), nms_radius).squeeze(0)
 
-            # STEP 3: Threshold with adaptive value
-            valid_mask = sal_nms > threshold
-            valid_coords = torch.nonzero(valid_mask, as_tuple=False)
-            valid_scores = sal_nms[valid_mask]
+            # Select top-k
+            sal_flat = sal_nms.flatten()
+            top_scores, top_indices = torch.topk(sal_flat, min(num_keypoints, len(sal_flat)))
 
-            # STEP 4: Select top-k by score
-            if len(valid_scores) >= num_keypoints:
-                # Have enough candidates - select top-k
-                k = num_keypoints
-                top_scores, top_indices = torch.topk(valid_scores, k)
-                top_coords = valid_coords[top_indices]
+            # Convert to 2D coordinates (patch space)
+            y_coords = top_indices // W
+            x_coords = top_indices % W
 
-                # Convert to (x, y) format
-                kpts = torch.stack([top_coords[:, 1], top_coords[:, 0]], dim=1).float()
-                scrs = top_scores
-
-            elif len(valid_scores) > 0:
-                # Have some candidates - use all of them + sample more from lower threshold
-                existing_kpts = torch.stack([valid_coords[:, 1], valid_coords[:, 0]], dim=1).float()
-                existing_scrs = valid_scores
-
-                # Need more keypoints - lower threshold gradually
-                remaining = num_keypoints - len(valid_scores)
-
-                # Try progressively lower thresholds
-                for percentile in [0.40, 0.30, 0.20, 0.10]:
-                    lower_threshold = torch.quantile(sal_flat, percentile)
-                    lower_threshold = max(lower_threshold.item(), 0.05)
-
-                    additional_mask = (sal_nms > lower_threshold) & (~valid_mask)
-                    additional_coords = torch.nonzero(additional_mask, as_tuple=False)
-                    additional_scores = sal_nms[additional_mask]
-
-                    if len(additional_scores) >= remaining:
-                        top_scores, top_indices = torch.topk(additional_scores, remaining)
-                        top_coords = additional_coords[top_indices]
-
-                        add_kpts = torch.stack([top_coords[:, 1], top_coords[:, 0]], dim=1).float()
-                        add_scrs = top_scores
-
-                        kpts = torch.cat([existing_kpts, add_kpts], dim=0)
-                        scrs = torch.cat([existing_scrs, add_scrs], dim=0)
-                        break
-                else:
-                    # Use what we have
-                    kpts = existing_kpts
-                    scrs = existing_scrs
-
-                    # Pad with highest remaining scores
-                    if len(kpts) < num_keypoints:
-                        all_scores = sal_b.flatten()
-                        remaining = num_keypoints - len(kpts)
-                        top_remaining, top_idx = torch.topk(all_scores, remaining)
-
-                        y_coords = top_idx // W
-                        x_coords = top_idx % W
-                        add_kpts = torch.stack([x_coords, y_coords], dim=1).float()
-
-                        kpts = torch.cat([kpts, add_kpts], dim=0)
-                        scrs = torch.cat([scrs, top_remaining], dim=0)
-            else:
-                # LAST RESORT: No valid candidates above threshold
-                # Select top-k from raw saliency (but still from high scores!)
-                sal_flat = sal_b.flatten()
-                top_scores, top_indices = torch.topk(sal_flat, num_keypoints)
-
-                y_coords = top_indices // W
-                x_coords = top_indices % W
-
-                kpts = torch.stack([x_coords, y_coords], dim=1).float()
-                scrs = top_scores
+            kpts = torch.stack([x_coords, y_coords], dim=1).float()
 
             # Ensure exactly num_keypoints
-            if len(kpts) > num_keypoints:
-                kpts = kpts[:num_keypoints]
-                scrs = scrs[:num_keypoints]
-            elif len(kpts) < num_keypoints:
-                # Pad with duplicates of highest score point
+            if len(kpts) < num_keypoints:
+                # Pad with duplicates of best keypoint
                 pad_size = num_keypoints - len(kpts)
-                best_idx = scrs.argmax()
+                best_kpt = kpts[0:1].repeat(pad_size, 1)
+                best_score = top_scores[0:1].repeat(pad_size)
 
-                pad_kpts = kpts[best_idx:best_idx+1].repeat(pad_size, 1)
-                pad_scrs = scrs[best_idx:best_idx+1].repeat(pad_size)
-
-                kpts = torch.cat([kpts, pad_kpts], dim=0)
-                scrs = torch.cat([scrs, pad_scrs], dim=0)
+                kpts = torch.cat([kpts, best_kpt], dim=0)
+                top_scores = torch.cat([top_scores, best_score], dim=0)
 
             keypoints_list.append(kpts)
-            scores_list.append(scrs)
+            scores_list.append(top_scores)
 
         keypoints = torch.stack(keypoints_list, dim=0)
         scores = torch.stack(scores_list, dim=0)
 
         return keypoints, scores
 
-    def _apply_nms(self, saliency: torch.Tensor, radius: int) -> torch.Tensor:
+    def _apply_nms(
+        self,
+        saliency: torch.Tensor,
+        radius: int
+    ) -> torch.Tensor:
         """Non-maximum suppression"""
         if radius == 0:
             return saliency
