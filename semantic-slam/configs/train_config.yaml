@@ -1,6 +1,9 @@
-# Training Configuration for Hybrid Semantic-Geometric SLAM
-# Following DINO-VO architecture with geometric constraints
-# FIXED: Simplified loss weights, proper camera handling
+# Training Configuration - FIXED
+# Key changes:
+# 1. InfoNCE loss instead of AP loss
+# 2. Geometric consistency loss for Stage 2
+# 3. Adaptive keypoint selection parameters
+# 4. Better loss weights based on DINO-VO
 
 # Model architecture
 model:
@@ -13,96 +16,100 @@ model:
   geometric_channels: 64
 
   # Feature fusion
-  fusion_dim: 256  # semantic (384) + geometric (64) → 256
+  fusion_dim: 256
 
   # Descriptor
   descriptor_dim: 128
   refiner_hidden: 256
   refiner_layers: 3
 
-  # Sub-pixel offset
+  # Sub-pixel offset (Stage 3)
   enable_offset: true
   offset_hidden: 128
 
-# Dataset configuration - ALL TUM SEQUENCES!
+# Dataset configuration
 dataset:
   root: "data/tum_rgbd"
 
-  # TRAINING: Mix of all difficulty levels and cameras
+  # TRAINING: Mix of all sequences
   train_sequences:
-    # Freiburg 1 (Kinect v1) - Good texture
+    # Freiburg 1 (Kinect v1)
     - "rgbd_dataset_freiburg1_desk"
     - "rgbd_dataset_freiburg1_desk2"
     - "rgbd_dataset_freiburg1_room"
     - "rgbd_dataset_freiburg1_teddy"
-    # Freiburg 1 - Low texture (include in training!)
-    - "rgbd_dataset_freiburg1_plant"
-    - "rgbd_dataset_freiburg1_floor"
-    # Freiburg 2 (different location)
+    - "rgbd_dataset_freiburg1_plant"  # Low texture
+    - "rgbd_dataset_freiburg1_floor"  # Low texture
+    # Freiburg 2
     - "rgbd_dataset_freiburg2_desk"
-    # Freiburg 3 (Kinect v2 - different camera)
+    # Freiburg 3 (Kinect v2)
     - "rgbd_dataset_freiburg3_sitting_xyz"
     - "rgbd_dataset_freiburg3_sitting_static"
 
-  # VALIDATION: 2 sequences (mix of fr1 and fr3)
+  # VALIDATION
   val_sequences:
     - "rgbd_dataset_freiburg1_xyz"
     - "rgbd_dataset_freiburg3_walking_static"
 
-  # TEST: For final evaluation ONLY - never seen during training
+  # TEST (final evaluation only)
   test_sequences:
     - "rgbd_dataset_freiburg3_long_office_household"
     - "rgbd_dataset_freiburg3_walking_xyz"
 
   frame_spacing: 1
-  max_frames: null  # Use all frames
+  max_frames: null
 
-  # Heavy augmentation for better generalization
+  # Heavy augmentation
   augmentation:
     enabled: true
-    # Photometric
     brightness: 0.3
     contrast: 0.3
     hue: 0.15
     saturation: 0.3
     gaussian_blur: 0.5
-    # Geometric (NEW!)
-    rotation: 15  # degrees
+    rotation: 15
     scale: [0.85, 1.15]
 
-# Loss configuration - SIMPLIFIED per research recommendations
-# Following Document 2: Use 3-4 core losses
+# Loss configuration - UPDATED!
 loss:
   weights:
-    # CORE LOSSES (always on)
-    ap: 2.0              # R2D2's AP loss - PRIMARY descriptor loss
-    variance: 1.0        # Prevent descriptor collapse
-    epipolar: 1.5        # Geometric consistency (CRITICAL for SLAM)
-    depth_reproj: 1.0    # Use RGB-D depth for 3D consistency
+    # CORE LOSSES (InfoNCE replaces AP)
+    infonce: 2.0           # Primary descriptor loss (CHANGED from 'ap')
+    variance: 1.0          # Prevent collapse
+    epipolar: 1.5          # Geometric consistency
+    depth_reproj: 1.0      # 3D consistency
 
-    # SECONDARY LOSSES (lower weight)
-    repeatability: 0.5   # Keypoint stability across frames
-    semantic_edge: 0.5   # Your contribution: semantic boundary alignment (FIXED formula)
+    # SECONDARY LOSSES
+    repeatability: 0.5     # Keypoint stability
+    semantic_edge: 0.5     # Semantic boundary alignment
 
-    # OPTIONAL LOSSES (can disable for debugging)
-    photometric: 0.3     # Appearance consistency (expensive)
-    offset: 0.5          # Sub-pixel refinement (Stage 3 only)
+    # OPTIONAL LOSSES
+    photometric: 0.3       # Appearance consistency
+    offset: 0.5            # Sub-pixel refinement (Stage 3)
 
-  # AP loss config
-  ap_kappa: 0.5         # Minimum expected AP
+    # NEW: Geometric consistency (prevents Stage 2 degradation!)
+    geo_consistency: 0.5   # Keep geometric features edge-responsive
+
+  # InfoNCE config
+  infonce_temperature: 0.07  # Following DINO-VO
 
   # Epipolar config
-  epipolar_threshold: 3.0  # pixels, used as beta for smooth_l1_loss
+  epipolar_threshold: 3.0
 
   # Variance config
-  min_variance: 0.005   # For 128-dim descriptors
+  min_variance: 0.005
 
-# Training configuration - 3 STAGE APPROACH
+# Keypoint selection parameters - CRITICAL FIXES!
+keypoints:
+  nms_radius: 4              # Pixels, not patches!
+  score_threshold: 0.1       # Only keep high-quality keypoints
+  adaptive_selection: true   # Don't force 500 if quality is low
+
+# Training configuration
 training:
-  # Stage 1: Geometric CNN pre-training (1 week)
+  # Stage 1: Geometric CNN (1 week)
   stage1_epochs: 10
   stage1_lr: 1e-4
-  stage1_focus: "geometric"  # Train only geometric CNN
 
   # Stage 2: Full training (2-3 weeks)
   stage2_epochs: 40
@@ -126,20 +133,17 @@ training:
 # Logging
 logging:
   use_wandb: false
-  project: "semantic-slam-hybrid"
-  run_name: "dino-cnn-geometric-v2-fixed"
+  project: "semantic-slam-hybrid-fixed"
+  run_name: "infonce-geo-consistency-v1"
   log_interval: 50
 
-# Camera intrinsics (TUM RGB-D)
-# NOTE: Now properly loaded per-sample from batch in train.py
+# Camera intrinsics (loaded per-sample from dataset)
 camera:
-  # Freiburg 1 & 2
   fr1_fx: 517.3
   fr1_fy: 516.5
   fr1_cx: 318.6
   fr1_cy: 255.3
 
-  # Freiburg 3
   fr3_fx: 535.4
   fr3_fy: 539.2
   fr3_cx: 320.1

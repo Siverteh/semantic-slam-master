@@ -227,6 +227,14 @@ class DepthReprojectionLoss(nn.Module):
             matched_kpts2 = matched_kpts2[valid_depth]
             depth_at_kpts = depth_at_kpts[valid_depth]
 
+            # Ensure keypoints are 2D tensors (K, 2) in case indexing introduced extra dims
+            if matched_kpts1.dim() > 2:
+                matched_kpts1 = matched_kpts1.reshape(-1, matched_kpts1.shape[-1])
+            if matched_kpts2.dim() > 2:
+                matched_kpts2 = matched_kpts2.reshape(-1, matched_kpts2.shape[-1])
+            if matched_kpts1.numel() == 0:
+                continue
+
             # VALIDATE camera intrinsics (detect if still using wrong camera)
             fx = K[b, 0, 0].item()
             fy = K[b, 1, 1].item()
